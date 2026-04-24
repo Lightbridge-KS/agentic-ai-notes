@@ -17,6 +17,8 @@ book:
       chapters: 
         - text: OpenClaw vs Hermes Agent
           href: "contents/harness/HermesAgent-vs-OpenClaw.qmd"
+        - text: Hermes Agent Python Core
+          href: "contents/harness/hermes-agent-python-core.qmd"
 
 format:
   html:

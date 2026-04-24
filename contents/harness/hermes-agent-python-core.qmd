@@ -1,0 +1,310 @@
+---
+title: "Hermes Agent: Core Python Libraries and Architecture Deep-Dive"
+---
+
+**Short answer up front:** Hermes Agent is **not** built on top of LangChain, LangGraph, PydanticAI, LlamaIndex, CrewAI, AutoGen, smolagents, or any other third-party agent framework. Its core is a **custom, hand-written synchronous agent loop** (`AIAgent.run_conversation()` in `run_agent.py`, roughly 10,700 lines) that talks to LLMs directly through the official `openai` and `anthropic` SDKs. It uses Pydantic for validation but not PydanticAI; it uses the official `mcp` Python SDK for Model Context Protocol support; and it leans heavily on a focused set of mature, well-known libraries (httpx, Rich, prompt_toolkit, PyYAML, Tenacity, croniter, python-telegram-bot, etc.) rather than wrapping a higher-level agent abstraction. This is a deliberate engineering choice — the Nous team wanted fine-grained control over the loop, provider dispatch, and context management, which higher-level frameworks would hide. ([Architecture — Hermes Agent docs](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture), [pyproject.toml snippet on GitHub code search](https://github.com/NousResearch/hermes-agent/blob/main/pyproject.toml))
+
+---
+
+## 1. Is Hermes Agent Built on an Existing Agent Framework?
+
+**No. It's fully custom.** Every message that flows through Hermes — whether from the CLI, Telegram, Discord, Slack, WhatsApp, a cron job, the batch runner, the ACP server, or the Python library embedding — ultimately calls the same `AIAgent.run_conversation()` method inside `run_agent.py`. There is no LangGraph state graph, no LangChain `AgentExecutor`, no PydanticAI `Agent`, and no CrewAI/AutoGen multi-agent abstraction underneath ([Hermes Agent architecture docs](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)).
+
+The loop itself is refreshingly simple and synchronous. A published extract of the actual code shows the shape:
+
+```python
+# run_agent.py — the main while loop
+while (api_call_count < self.max_iterations
+       and self.iteration_budget.remaining > 0) \
+      or self._budget_grace_call:
+    if self._interrupt_requested:
+        break
+    response = client.chat.completions.create(
+        model=model, messages=messages, tools=tool_schemas
+    )
+    if response.tool_calls:
+        for tool_call in response.tool_calls:
+            result = handle_function_call(
+                tool_call.name, tool_call.args, task_id
+            )
+            messages.append(tool_result_message(result))
+        api_call_count += 1
+    else:
+        return response.content
+```
+
+That's the whole agentic pattern — a classic "ReAct-style" tool-calling loop with a double gate (iteration counter + thread-safe `IterationBudget` shared across parent and subagents) ([Agent Loop Internals](https://hermes-agent.nousresearch.com/docs/developer-guide/agent-loop), [Ken Huang — Chapter 3: Agent Loop, Claude Code vs. Hermes](https://kenhuangus.substack.com/p/chapter-3-the-query-agent-loop-claude)).
+
+Compared to the popular alternatives:
+
+| Framework pattern | What it looks like | Hermes uses it? |
+|---|---|---|
+| **LangGraph** — `StateGraph` with nodes, edges, conditional routing | `workflow.add_node(...)`, `workflow.add_edge(...)` | ❌ No — Hermes has one imperative `while` loop, no graph |
+| **PydanticAI** — type-safe `Agent[Deps, ResultT]` with Pydantic-validated outputs | `agent = Agent(model, result_type=MyModel)` | ❌ No — Hermes uses Pydantic for *data classes*, not as an agent framework |
+| **smolagents** — code-writing agents that emit Python as their action language | CodeAgent writes Python to call tools | ⚠️ Similar spirit in `execute_code` (programmatic tool calling via RPC), but Hermes's primary loop is classic JSON-tool-calling |
+| **LangChain `AgentExecutor`** — tool-call abstraction + callbacks + chains | `AgentExecutor.from_agent_and_tools(...)` | ❌ No LangChain anywhere in the dependency tree |
+| **CrewAI / AutoGen** — multi-agent orchestration by framework | `Crew([agent1, agent2], tasks=...)` | ❌ Hermes's subagents are spawned by its own `delegate_task` tool creating new `AIAgent` instances |
+
+The architectural section of the official docs even names its own six design principles — prompt stability, observable execution, interruptibility, platform-agnostic core, loose coupling, profile isolation — none of which reference a parent framework ([Architecture — Design Principles](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)).
+
+---
+
+## 2. Core Dependencies (from `pyproject.toml`, v0.9.0 / v0.10.0)
+
+The core `dependencies = [...]` block of `pyproject.toml` at `main` lists a tight set of pinned libraries, with an explicit comment that they're "pinned to known-good ranges to limit supply chain attack surface" ([pyproject.toml, search-indexed copy](https://github.com/NousResearch/hermes-agent/blob/main/pyproject.toml)). The complete core list:
+
+| Purpose | Package | Pin |
+|---|---|---|
+| OpenAI-compatible LLM client (primary path) | `openai` | `>=2.21.0,<3` |
+| Native Anthropic Messages API client | `anthropic` | `>=0.39.0,<1` |
+| Env-var loading | `python-dotenv` | `>=1.2.1,<2` |
+| CLI argument / entrypoint dispatch | `fire` (Google Fire) | `>=0.7.1,<1` |
+| HTTP client (sync + async, with SOCKS support) | `httpx[socks]` | `>=0.28.1,<1` |
+| Banners, panels, Markdown, color in CLI | `rich` | `>=14.3.3,<15` |
+| Retries / backoff | `tenacity` | `>=9.1.4,<10` |
+| Config file format | `pyyaml` | `>=6.0.2,<7` |
+| HTTP for legacy/sync paths | `requests` | `>=2.33.0,<3` |
+| Templating (system prompts, etc.) | `jinja2` | `>=3.1.5,<4` |
+| Data validation / schema / model | `pydantic` | `>=2.12.5,<3` |
+| Interactive REPL input, history, autocomplete | `prompt_toolkit` | `>=3.0.52,<4` |
+| Web search tool | `exa-py` | `>=2.9.0,<3` |
+| Web extraction / crawling tool | `firecrawl-py` | `>=4.16.0,<5` |
+| Parallel web search provider | `parallel-web` | `>=0.4.2,<1` |
+| Media generation tool | `fal-client` | `>=0.13.1,<1` |
+| Free TTS backend | `edge-tts` | `>=7.2.7,<8` |
+
+([pyproject.toml search result](https://github.com/NousResearch/hermes-agent/blob/main/pyproject.toml))
+
+### Optional extras (install groups)
+
+Most non-core functionality is gated behind pip extras, installable as `.[messaging]`, `.[mcp]`, `.[voice]`, `.[all]`, `.[termux]`, `.[dev]`, etc. Confirmed contents from the repo and community packaging:
+
+| Extra | Notable packages |
+|---|---|
+| `messaging` | `python-telegram-bot[webhooks] >=22.6,<23`, `discord.py[voice] >=2.7.1,<3`, `aiohttp >=3.13.3,<4`, `slack-bolt >=1.18.0,<2`, `slack-sdk >=3.27.0,<4` ([pyproject.toml](https://github.com/NousResearch/hermes-agent/blob/main/pyproject.toml)) |
+| `mcp` | `mcp` (the official Anthropic/community Python MCP SDK) ([Use MCP with Hermes](https://hermes-agent.nousresearch.com/docs/guides/use-mcp-with-hermes), [MCP docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)) |
+| `cron` | `croniter` for cron expression parsing ([Cron internals](https://deepwiki.com/NousResearch/hermes-agent/5.5-cron-and-scheduling), [AUR package notes](https://aur.archlinux.org/packages/hermes-agent-git?all_deps=1)) |
+| `voice` / `tts-premium` | `faster-whisper`, `elevenlabs`, `pyaudio` ([Quickstart](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart/), [AUR](https://aur.archlinux.org/packages/hermes-agent-git?all_deps=1)) |
+| `rl` (RL training) | `atroposlib` and `tinker`, both installed as pinned git-commit dependencies via `git+https://github.com/NousResearch/atropos.git@...` and `git+https://github.com/thinking-machines-lab/tinker.git@...` ([pyproject.toml](https://github.com/NousResearch/hermes-agent/blob/main/pyproject.toml), [README](https://github.com/NousResearch/hermes-agent)) |
+| Memory | `honcho-ai` (optional plugin, dialectic user modeling) ([Docs overview](https://hermes-agent.nousresearch.com/docs/)) |
+| Sandboxes | `modal`, `python-daytona`, (Docker/SSH use stdlib + subprocess) |
+| ACP | `agent-client-protocol` (referenced as the official Apache-2.0 SDK from Zed, Pydantic models + asyncio transport) ([Feature request #569](https://github.com/NousResearch/hermes-agent/issues/569)) |
+| Auth helpers | `pyjwt` (for the Skills Hub GitHub App) ([AUR](https://aur.archlinux.org/packages/hermes-agent-git?all_deps=1)) |
+
+One noteworthy historical detail: earlier releases (v0.3.0 / v0.4.0 era, February–March 2026) **did** depend on `litellm >=1.75.5` as an LLM-routing abstraction, but after the March 2026 LiteLLM PyPI supply-chain incident Nous removed the dependency entirely in commit 18cbd18f, re-implementing the provider routing in-house ([Issue #2790 — Docker builds broken: litellm quarantined](https://github.com/NousResearch/hermes-agent/issues/2790), [Issue #3579 — docs install footgun reintroduces litellm](https://github.com/NousResearch/hermes-agent/issues/3579)). That's worth emphasizing: **as of v0.10.0, Hermes has no LiteLLM, no LangChain, no LangGraph in its dependency tree.** Provider routing is now a first-party `runtime_provider.py` that maps `(provider, model)` tuples to `(api_mode, api_key, base_url)` ([Adding Providers dev guide](https://hermes-agent.nousresearch.com/docs/developer-guide/adding-providers)).
+
+### What Hermes conspicuously does **not** depend on
+
+- **No LangChain / LangGraph / LlamaIndex** — grep the `dependencies = [...]` block; they're absent.
+- **No PydanticAI** — Pydantic v2 is used for data models and schema validation, but the agent is not a PydanticAI `Agent`.
+- **No AutoGen / CrewAI / smolagents**.
+- **No framework-level callback managers** (LangChain-style). Callbacks are platform-specific functions like `tool_progress_callback`, `clarify_callback`, `step_callback` wired into `AIAgent` directly.
+- **No vector DB dependency in core** — memory is Markdown (`MEMORY.md`, `USER.md`) plus SQLite FTS5 for session search, not a vectorstore. (Honcho can be added as a plugin if you want embedding-based memory.)
+
+---
+
+## 3. Architecture: What the Custom Loop Looks Like
+
+Here is the internal topology as documented by the project's own architecture page and DeepWiki index ([Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture), [DeepWiki overview](https://deepwiki.com/NousResearch/hermes-agent)):
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Entry Points                                  │
+│                                                                      │
+│  CLI (cli.py)    Gateway (gateway/run.py)    ACP (acp_adapter/)     │
+│  Batch Runner    API Server (aiohttp)        Python Library         │
+│  TUI (ui-tui + tui_gateway, JSON-RPC over stdio)                     │
+└──────────┬──────────────┬───────────────────────┬───────────────────┘
+           │              │                       │
+           ▼              ▼                       ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     AIAgent (run_agent.py)                          │
+│                                                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
+│  │ Prompt       │  │ Provider     │  │ Tool         │               │
+│  │ Builder      │  │ Resolution   │  │ Dispatch     │               │
+│  │ (prompt_     │  │ (runtime_    │  │ (model_      │               │
+│  │  builder.py) │  │  provider.py)│  │  tools.py)   │               │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘               │
+│         │                 │                 │                       │
+│  ┌──────┴───────┐  ┌──────┴───────┐  ┌──────┴───────┐               │
+│  │ Compression  │  │ 3 API Modes  │  │ Tool Registry│               │
+│  │ & Caching    │  │ chat_compl.  │  │ 47 tools     │               │
+│  │              │  │ codex_resp.  │  │ 19 toolsets  │               │
+│  │              │  │ anthropic    │  │              │               │
+│  └──────────────┘  └──────────────┘  └──────────────┘               │
+└─────────────────────────────────────────────────────────────────────┘
+           │                                    │
+           ▼                                    ▼
+┌───────────────────┐              ┌──────────────────────┐
+│ Session Storage   │              │ Tool Backends         │
+│ (SQLite + FTS5)   │              │ Terminal (6 backends) │
+│ hermes_state.py   │              │ Browser (5 backends)  │
+│ gateway/session.py│              │ Web (4 backends)      │
+└───────────────────┘              │ MCP (dynamic)         │
+                                   │ File, Vision, etc.    │
+                                   └──────────────────────┘
+```
+*(Reproduced from the official architecture docs. ([Architecture page](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)))*
+
+### 3.1 The agent loop (`run_agent.py`)
+
+- **Language / style**: synchronous top-level Python. Returns a final string (or dict) when done — **not** a generator and not fundamentally a streaming interface at the top level. Streaming *within* a turn is handled by a wrapper: `_interruptible_api_call()` runs the actual HTTP POST in a background thread and lets the main thread wait on either the response, an interrupt event, or a timeout ([Agent Loop Internals](https://hermes-agent.nousresearch.com/docs/developer-guide/agent-loop)).
+- **Budget**: an `IterationBudget` class with a `threading.Lock` is the shared gate across a parent agent and any subagents it spawns. The `while` condition combines `api_call_count < max_iterations` with `iteration_budget.remaining > 0` ([Ken Huang — agent loop comparison](https://kenhuangus.substack.com/p/chapter-3-the-query-agent-loop-claude)).
+- **Three API modes** — a single `api_mode` string controls request construction: `chat_completions` (most providers; goes through the `openai` SDK with a swapped `base_url`), `codex_responses` (OpenAI Codex Responses API), and `anthropic_messages` (native Anthropic Messages via `agent/anthropic_adapter.py` + the `anthropic` SDK, including prompt caching and cache-breakpoint logic) ([Adding Providers](https://hermes-agent.nousresearch.com/docs/developer-guide/adding-providers)).
+- **Message format**: strict OpenAI-style dicts `{"role": "system"|"user"|"assistant"|"tool", ...}` with reasoning content stashed under `assistant_msg["reasoning"]`. The loop enforces role alternation rules that providers will reject if broken ([Agent Loop Internals](https://hermes-agent.nousresearch.com/docs/developer-guide/agent-loop)).
+- **Preflight compression**: before each API call, the loop estimates token usage; if the conversation exceeds ~50% of the model's context window, `ContextCompressor` in `agent/context_compressor.py` uses an auxiliary LLM to summarize middle messages, preserves the last N intact, and creates a new child session lineage ID so SQLite keeps the reference chain ([MranAnand Substack — Inside Hermes Agent](https://mranand.substack.com/p/inside-hermes-agent-how-a-self-improving), [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)).
+- **Fallback chain**: on 429/5xx/401/403 the agent can swap to an ordered list of backup providers mid-session without losing the conversation. Auxiliary tasks (vision, compression, summarization, session search) each have independent fallback chains ([AI Providers](https://hermes-agent.nousresearch.com/docs/integrations/providers), [Agent Loop Internals](https://hermes-agent.nousresearch.com/docs/developer-guide/agent-loop)).
+
+### 3.2 Tool system
+
+A classic **import-time registry pattern** — no framework plumbing, just Python imports:
+
+```
+tools/registry.py           (no deps — imported by all tool files)
+       ↑
+tools/*.py                  (each calls registry.register() at import time)
+       ↑
+model_tools.py              (imports tools/registry + triggers tool discovery)
+       ↑
+run_agent.py, cli.py, batch_runner.py, environments/
+```
+*(Directly from the architecture docs' File Dependency Chain section ([Architecture — File Dependency Chain](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)))*.
+
+- `tools/registry.py` is the central `ToolRegistry` that holds JSON schemas and handler callables for all 47 registered tools across 19 toolsets ([Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture), [DeepWiki tool system](https://deepwiki.com/NousResearch/hermes-agent)).
+- **Tool-calling mechanism**: **native function calling** via the provider's JSON-schema tools API — Hermes passes `tools=[...]` to `client.chat.completions.create` (or the equivalent for Codex/Anthropic modes), receives structured `tool_calls`, and dispatches via `handle_function_call(name, args, task_id)` in `model_tools.py`. No ReAct-style text parsing, no YAML-in-a-code-block tricks for the primary path ([Agent Loop Internals](https://hermes-agent.nousresearch.com/docs/developer-guide/agent-loop)).
+- Schemas are plain Python dicts adhering to the JSON Schema that OpenAI/Anthropic accept — built manually per tool, not derived from Pydantic models the way PydanticAI would.
+
+### 3.3 `execute_code` — programmatic tool calling
+
+This is the most interesting piece architecturally, and the closest Hermes gets to "code-writing agent" territory:
+
+- The LLM writes a Python script that does `from hermes_tools import web_search, terminal, read_file, patch, ...` and calls those functions natively.
+- Hermes dynamically generates a `hermes_tools.py` stub module that translates each function call into **JSON-RPC over a Unix Domain Socket** back to the parent Hermes process ([Code Execution feature docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/code-execution), [DeepWiki 5.7 Sandbox](https://deepwiki.com/NousResearch/hermes-agent/5.7-code-execution-sandbox)).
+- The child runs as a separate **subprocess** using Python's stdlib (no RestrictedPython, no Jupyter kernel, no Pyodide) on the project venv's interpreter; on remote backends (Docker/SSH/Modal/Daytona) it falls back to file-polling RPC because direct sockets aren't available.
+- Sensitive env vars (anything matching `KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSWD|AUTH`) are scrubbed; default limits are 300 s timeout, 50 tool calls per script, 50 KB stdout cap, 10 KB stderr cap; the tool whitelist explicitly *excludes* recursive `execute_code`, `delegate_task`, and MCP tools ([DeepWiki 5.6 Code Execution & MCP](https://deepwiki.com/NousResearch/hermes-agent/5.6-web-and-browser-tools)).
+- The feature is disabled on Windows because it relies on UDS ([Code Execution](https://hermes-agent.nousresearch.com/docs/user-guide/features/code-execution)).
+
+This is closer to the Anthropic "code execution tool" / "agent skills" pattern than to smolagents — the primary loop still uses JSON tool-calls; `execute_code` is one *among* 47 tools, chosen when the LLM wants to collapse a multi-step pipeline into one turn without letting intermediate results consume context.
+
+### 3.4 `delegate_task` — subagents
+
+- `tools/delegate_tool.py` spawns a **new `AIAgent` instance** in-process (not a separate subprocess) with `skip_context_files=True`, its own `IterationBudget` capped by `delegation.max_iterations` (default 50), and isolated conversation state ([Using Hermes as a Python Library](https://hermes-agent.nousresearch.com/docs/guides/python-library), [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)).
+- The shared `IterationBudget`'s `threading.Lock` means total work across parent + children is bounded but each agent counts independently ([Ken Huang — Agent Loop](https://kenhuangus.substack.com/p/chapter-3-the-query-agent-loop-claude)).
+- There's no AutoGen/CrewAI-style orchestrator — it's literally "parent calls a tool that constructs a child, runs `child.run_conversation(prompt)`, returns the child's summary string".
+
+### 3.5 MCP (Model Context Protocol)
+
+- **Client:** `tools/mcp_tool.py` (~1,050–2,200 lines depending on version) is a hand-rolled client on top of the **official `mcp` Python SDK** — not FastMCP, not a custom protocol implementation. It uses `ClientSession(read_stream, write_stream)` directly and handles stdio + HTTP/StreamableHTTP transports, notifications like `tools/list_changed`, per-server tool filtering, and OAuth 2.1 with PKCE via `tools/mcp_oauth.py` ([mcp_tool.py source snippet](https://github.com/NousResearch/hermes-agent/blob/main/tools/mcp_tool.py), [MCP docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp), [Feature #342 analysis of FastMCP option](https://github.com/NousResearch/hermes-agent/issues/342)).
+- An MCP background event loop (`_mcp_loop`) runs in a daemon thread, one long-lived `MCPServerTask` per configured server, with exponential-backoff reconnection ([DeepWiki 5.6](https://deepwiki.com/NousResearch/hermes-agent/5.6-web-and-browser-tools)).
+- **Server:** `mcp_serve.py` turns Hermes into an MCP server that exposes messaging conversations as tools to other MCP clients (Claude Desktop, Cursor, etc.) — added in v0.6.0 (March 30, 2026) ([mcp_serve.py](https://github.com/NousResearch/hermes-agent/blob/main/mcp_serve.py), [FAQ](https://hermesagents.net/faq/)).
+
+### 3.6 Session persistence, memory, search
+
+- **`hermes_state.py`** is a hand-written SQLite wrapper (`SessionDB`) over the Python stdlib `sqlite3` module — **no `sqlalchemy`, no `sqlite-utils`**. It creates FTS5 virtual tables for full-text `session_search` and handles atomic writes with lock contention ([DeepWiki — Architecture Overview](https://deepwiki.com/NousResearch/hermes-agent/1.1-architecture-overview), [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)).
+- Memory is plain Markdown: `~/.hermes/memories/MEMORY.md` (facts) and `USER.md` (user profile), loaded verbatim into the system prompt ([Overview — DeepWiki](https://deepwiki.com/NousResearch/hermes-agent)).
+- Skills are `SKILL.md` files under `~/.hermes/skills/`, loaded on demand by slash command or agent decision — compatible with the open [agentskills.io](https://agentskills.io) standard.
+- Pluggable memory providers: **Honcho** (via the `honcho-ai` package) is the reference implementation of the `MemoryProvider` ABC for dialectic user modeling and cross-session recall ([Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture), [Docs overview](https://hermes-agent.nousresearch.com/docs/)).
+
+### 3.7 Async, HTTP, CLI choices
+
+| Subsystem | Library | Notes |
+|---|---|---|
+| HTTP (primary) | `httpx[socks]` | Both sync and async; SOCKS proxy support included |
+| HTTP (legacy sync) | `requests` | Pinned `>=2.33.0,<3` for CVE-2026-25645 |
+| HTTP (gateway) | `aiohttp >=3.13.3,<4` | Used for the aiohttp-based API server and persistent sessions in messaging adapters ([Issue #10865](https://github.com/NousResearch/hermes-agent/issues/10865), [Issue #11635](https://github.com/NousResearch/hermes-agent/issues/11635)) |
+| Async framework | Python stdlib `asyncio` + `concurrent.futures` + `threading` | No `trio`, no `anyio` in core |
+| Classic CLI | `prompt_toolkit` + `rich` | Fixed input pane at the bottom with `TextArea`; `patch_stdout()` keeps background spinner updates from corrupting the input line; history via `prompt_toolkit.history.FileHistory` to `~/.hermes_history` ([Interactive Chat — DeepWiki](https://deepwiki.com/NousResearch/hermes-agent/3.1-interactive-chat)) |
+| Modern TUI (`hermes --tui`) | Node **Ink** (React) frontend + Python `tui_gateway` backend, newline-delimited JSON-RPC over stdio | Not Textual — despite Rich being used, the modern TUI crossed into TypeScript/Ink for richer rendering ([TUI docs](https://hermes-agent.nousresearch.com/docs/user-guide/tui), [Issue #12130 TUI audit](https://github.com/NousResearch/hermes-agent/issues/12130)) |
+| CLI command dispatch | `fire` (Google Fire) | Not Typer, not Click — `fire >=0.7.1,<1` for CLI entrypoints ([pyproject.toml](https://github.com/NousResearch/hermes-agent/blob/main/pyproject.toml)). Note: Typer was removed in the same March 2026 supply-chain commit that dropped LiteLLM ([Issue #3579](https://github.com/NousResearch/hermes-agent/issues/3579)) |
+| Interactive menus (setup wizard, tools config) | Python stdlib `curses` | Deliberate choice over `simple_term_menu` due to rendering bugs in tmux/iTerm2 ([AGENTS.md](https://github.com/NousResearch/hermes-agent/blob/main/AGENTS.md)) |
+| Config files | YAML via `pyyaml` + `.env` via `python-dotenv` | No pydantic-settings, no dynaconf, no hydra. Validation is custom in `hermes_cli/config.py` |
+| Retries | `tenacity` | For backoff/retry on 429/5xx |
+| Templating | `jinja2` | System prompts and skill templates |
+| Validation | `pydantic` v2 | For data classes and typed config blocks, *not* as an agent layer |
+| Scheduling | `croniter` (optional via `cron` extra) + custom scheduler in `cron/scheduler.py` | **Not APScheduler.** A file-locked (`fcntl.LOCK_EX`) tick loop runs every 60 s inside the gateway daemon; jobs persist to `~/.hermes/cron/jobs.json` with atomic write-and-rename; `compute_next_run()` delegates to `croniter.get_next()` for cron-kind schedules ([Cron Internals](https://hermes-agent.nousresearch.com/docs/developer-guide/cron-internals), [DeepWiki 5.5](https://deepwiki.com/NousResearch/hermes-agent/5.5-cron-and-scheduling)) |
+| Logging | `hermes_logging.py` + `loguru` is *not* used — it's plain stdlib `logging` with multi-file handlers at `~/.hermes/logs/` (`agent.log`, `errors.log`, `gateway.log`) ([AGENTS.md](https://github.com/NousResearch/hermes-agent/blob/main/AGENTS.md), [release notes](https://github.com/NousResearch/hermes-agent/releases)) |
+| Messaging platforms | `python-telegram-bot[webhooks]`, `discord.py[voice]`, `slack-bolt`/`slack-sdk`, plus in-house adapters for WhatsApp, Signal, Matrix, Mattermost, Email, SMS, DingTalk, Feishu, WeCom, BlueBubbles (iMessage), Home Assistant | 18 platform adapters in `gateway/platforms/` ([Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)) |
+| ACP (editor integration) | `agent-client-protocol` (Apache-2.0, from Zed) | Uses its Pydantic models and asyncio stdio transport ([Issue #569](https://github.com/NousResearch/hermes-agent/issues/569)) |
+| RL training | `atroposlib` + `tinker` (git-pinned) | Atropos is the Nous-built LLM RL environments framework ([atropos repo](https://github.com/NousResearch/atropos)); ships as submodules or via `.[all,dev]`. Trajectories are exported in ShareGPT JSONL format ([README](https://github.com/NousResearch/hermes-agent), [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)) |
+| Search / crawling tools | `exa-py`, `firecrawl-py`, `parallel-web` | Multiple web backends the user can select with `hermes tools` |
+| TTS | `edge-tts` (default, free), optional `elevenlabs`, OpenAI, MiniMax, NeuTTS | ([Features overview](https://hermes-agent.nousresearch.com/docs/user-guide/features/overview)) |
+| STT | `faster-whisper` via the `voice` extra (optional) | ([Quickstart](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart/)) |
+| Dependency/package manager | **uv** (Astral) + pip-compatible `pyproject.toml` | Python 3.11+ required; install script bootstraps uv first ([README](https://github.com/NousResearch/hermes-agent)) |
+
+---
+
+## 4. Atropos Integration
+
+Atropos is a separate Nous Research project — an "LLM Reinforcement Learning Environments framework for collecting and evaluating LLM trajectories" ([Atropos repo](https://github.com/NousResearch/atropos)). Hermes wires it in via:
+
+1. The `environments/` directory in `hermes-agent` contains Atropos-compatible environment classes that wrap `AIAgent` as a rollout source ([Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)).
+2. The `atroposlib` package is pulled in as a **git-pinned dependency** in `pyproject.toml` (exact commit `c20c85256e5a45ad31edf8b7276e9c5ee1995a30` at the time of writing), alongside `tinker` from `thinking-machines-lab/tinker.git@30517b667f...` ([pyproject.toml](https://github.com/NousResearch/hermes-agent/blob/main/pyproject.toml)).
+3. An optional `setup-hermes.sh` step also installs a `tinker-atropos` git submodule when present, for training backends on platforms that support it ([setup-hermes.sh](https://github.com/NousResearch/hermes-agent/blob/main/setup-hermes.sh)).
+4. Trajectory export is a first-class concern of `AIAgent`: `save_trajectories=True` writes each conversation as a JSONL line in ShareGPT format, and `batch_runner.py` runs many prompts in parallel to generate training data ([Python library guide](https://hermes-agent.nousresearch.com/docs/guides/python-library), [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)).
+
+So the relationship is: **Atropos is an external sibling package** (a library + RL training harness), not vendored into Hermes. Hermes imports its `atroposlib` API and implements environments that talk to Hermes's own `AIAgent`, with results serialized in ShareGPT trajectories.
+
+---
+
+## 5. Honest Summary of Engineering Choices
+
+**Hermes is deliberately un-frameworked.** Reading the codebase through the lens of "where did they decline to use a popular library?" is instructive:
+
+- **No LangChain/LangGraph** — Nous wanted direct control over context compression, cache-breakpoint placement, role-alternation enforcement, and mid-session provider failover. All of those become awkward when a graph abstraction or `AgentExecutor` owns the loop.
+- **No PydanticAI** — Tools are defined as Python functions that `registry.register()` themselves with hand-written JSON-schema dicts. This keeps LLM-facing schemas tight (only what the provider actually needs) and avoids coupling tool authorship to Pydantic model authorship.
+- **No LiteLLM (as of v0.10.0)** — Removed after the March 2026 supply-chain incident; Nous now maintains its own `runtime_provider.py` dispatching between `chat_completions`, `codex_responses`, and `anthropic_messages` api modes. This also explains the *three* adapters rather than a unified wire format — OpenAI, OpenAI Codex, and native Anthropic Messages each get their own path for things like prompt caching and reasoning-content handling.
+- **No APScheduler** — A hand-rolled file-locked tick loop inside the gateway suffices because all scheduled work is agent tasks (full `AIAgent` runs), not arbitrary Python callables.
+- **No SQLAlchemy** — Plain stdlib `sqlite3` plus FTS5 is enough for session/state storage and avoids an ORM layer between the agent and its data.
+- **Tool registration is import-time**, not declarative — you drop a `tools/my_tool.py` file that calls `registry.register(...)` at module load; `model_tools.py` imports the package and everything shows up. That's a conscious rejection of plugin systems that require manifests.
+
+The trade-offs are exactly what you'd expect: Hermes has one very large file (`run_agent.py` at ~10,700 lines; `cli.py` at ~10,000 lines) that concentrates a lot of logic, and there is **more code to own** than if they'd built on LangGraph. But the team gets exact control over the loop — cache stability, interrupt semantics, budget accounting, fallback chains — and the dependency tree is small, pinned, and auditable. For a lab whose other products are model training frameworks (Atropos, Psyche, DisTrO, RL), owning the whole loop makes the agent usable as a rollout generator for training data, which a framework-wrapped agent would make harder ([Architecture — Design Principles](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture), [Nous Research org page](https://github.com/nousresearch)).
+
+---
+
+## 6. Quick Reference: Hermes vs. Framework-Based Alternatives
+
+| Concern | Hermes Agent | LangGraph | PydanticAI | smolagents |
+|---|---|---|---|---|
+| Core loop | Custom `while` in `run_agent.py` | StateGraph nodes/edges | `Agent.run()` with DI | CodeAgent emits Python |
+| LLM client | `openai` + `anthropic` SDKs directly, 3 api_modes | Via `langchain_*` packages | Via model-specific adapters | Via Hugging Face or SDKs |
+| Tool calling | Native function calling, JSON-schema | Native via `bind_tools()` | Pydantic-typed tools | Python code as action |
+| Validation | Pydantic v2 for data, hand-written JSON schema for tools | Pydantic-based | Pydantic-first throughout | Python typing |
+| Multi-agent | Own `delegate_task` tool spawning child `AIAgent`s | Subgraphs | Agent-as-tool | Multi-agent patterns |
+| MCP | Official `mcp` SDK, hand-written client + server | Via community extensions | — | — |
+| Streaming | Interruptible HTTP in a thread; top-level returns final result | First-class async streaming | First-class async streaming | Varies |
+| Persistence | `sqlite3` + FTS5, Markdown memory, JSON cron jobs | Checkpointers (SQLite/Postgres/Redis) | Message history objects | Minimal |
+| Scheduler | Custom tick in gateway + `croniter` | — | — | — |
+| UI | prompt_toolkit + Rich (classic), Ink/React (TUI v2) | — | — | — |
+
+---
+
+## 7. Sources and Further Reading
+
+Primary:
+- **Architecture (authoritative):** [hermes-agent.nousresearch.com/docs/developer-guide/architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)
+- **Agent Loop Internals:** [hermes-agent.nousresearch.com/docs/developer-guide/agent-loop](https://hermes-agent.nousresearch.com/docs/developer-guide/agent-loop)
+- **Adding Providers (api_mode design):** [hermes-agent.nousresearch.com/docs/developer-guide/adding-providers](https://hermes-agent.nousresearch.com/docs/developer-guide/adding-providers)
+- **Code Execution / Programmatic Tool Calling:** [hermes-agent.nousresearch.com/docs/user-guide/features/code-execution](https://hermes-agent.nousresearch.com/docs/user-guide/features/code-execution)
+- **MCP client/server usage:** [hermes-agent.nousresearch.com/docs/user-guide/features/mcp](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)
+- **Cron internals:** [hermes-agent.nousresearch.com/docs/developer-guide/cron-internals](https://hermes-agent.nousresearch.com/docs/developer-guide/cron-internals)
+- **Source — pyproject.toml:** [github.com/NousResearch/hermes-agent/blob/main/pyproject.toml](https://github.com/NousResearch/hermes-agent/blob/main/pyproject.toml)
+- **Source — `mcp_tool.py`:** [github.com/NousResearch/hermes-agent/blob/main/tools/mcp_tool.py](https://github.com/NousResearch/hermes-agent/blob/main/tools/mcp_tool.py)
+- **Source — `cron/scheduler.py`:** [github.com/NousResearch/hermes-agent/blob/main/cron/scheduler.py](https://github.com/NousResearch/hermes-agent/blob/main/cron/scheduler.py)
+- **Source — `AGENTS.md`:** [github.com/NousResearch/hermes-agent/blob/main/AGENTS.md](https://github.com/NousResearch/hermes-agent/blob/main/AGENTS.md)
+
+Secondary (DeepWiki indexed as of 25 February 2026, commit 54e50b8a, so some specifics may lag main):
+- **Repo overview:** [deepwiki.com/NousResearch/hermes-agent](https://deepwiki.com/NousResearch/hermes-agent)
+- **Conversation loop detail:** [deepwiki.com/NousResearch/hermes-agent/4.1-conversation-loop-and-tool-calling](https://deepwiki.com/NousResearch/hermes-agent/4.1-conversation-loop-and-tool-calling)
+- **Code execution & MCP:** [deepwiki.com/NousResearch/hermes-agent/5.6-web-and-browser-tools](https://deepwiki.com/NousResearch/hermes-agent/5.6-web-and-browser-tools)
+- **Cron & scheduling:** [deepwiki.com/NousResearch/hermes-agent/5.5-cron-and-scheduling](https://deepwiki.com/NousResearch/hermes-agent/5.5-cron-and-scheduling)
+
+Third-party / commentary:
+- **Inside Hermes Agent:** [mranand.substack.com/p/inside-hermes-agent-how-a-self-improving](https://mranand.substack.com/p/inside-hermes-agent-how-a-self-improving)
+- **Claude Code vs Hermes Agent — Chapter 3 (loop comparison with code):** [kenhuangus.substack.com/p/chapter-3-the-query-agent-loop-claude](https://kenhuangus.substack.com/p/chapter-3-the-query-agent-loop-claude)
+- **Hermes Agent v0.10 reference:** [blakecrosley.com/guides/hermes](https://blakecrosley.com/guides/hermes)
+- **AUR package dependency list (community-extracted):** [aur.archlinux.org/packages/hermes-agent-git](https://aur.archlinux.org/packages/hermes-agent-git?all_deps=1)
+- **LiteLLM removal context:** [Issue #2790](https://github.com/NousResearch/hermes-agent/issues/2790), [Issue #3579](https://github.com/NousResearch/hermes-agent/issues/3579)
+
+### Caveat on currency
+A handful of specifics — exact version pins, precise line counts, which v0.x introduced which feature — shift every release (Hermes ships frequently and had a major refactor after the March 2026 LiteLLM incident). For anything you plan to depend on, the authoritative source is `pyproject.toml` on `main` at your installed SHA and the `AGENTS.md` file in-tree. Everything in this report was cross-checked against the v0.9.0 / v0.10.0-era repository state (April 2026). The DeepWiki index is pinned at commit 54e50b8a (late Feb 2026), so its repo-layout tables reflect the pre-v0.6.0 state — I've preferred the live docs and pyproject for current facts where they disagreed.
