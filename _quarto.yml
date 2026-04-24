@@ -9,6 +9,10 @@ book:
   site-url: https://agentic-ai-notes-lightbridge.netlify.app
   chapters:
     - index.qmd
+    - part: Harness
+      chapters: 
+        - text: OpenClaw vs Hermes Agent
+          href: "contents/harness/HermesAgent-vs-OpenClaw.qmd"
 
 format:
   html:

@@ -1,0 +1,370 @@
+---
+title: "Hermes Agent vs OpenClaw"
+subtitle: "Hermes Agent vs OpenClaw — A Deep Comparative Analysis for a Mac‑Based Multi‑Channel Power User"
+---
+
+**Scope & framing.** You already run OpenClaw daily on an M3 Pro / 36 GB MacBook Pro, with a local gateway bridged to Telegram, LINE, various Google Workspace CLIs, Apple Calendar, and a stack of skills. You've heard Hermes Agent from Nous Research is "trending" with "unique auto-learning." This report grounds both tools (both released after typical training cutoffs), clears up what "pi" actually is, dissects the architectures, compares them across nine dimensions, and ends with a recommendation tailored to a radiology-AI unit setup.
+
+A blunt preview of the conclusion: these are **different shaped products** — Hermes is a *self‑improving agent runtime*, OpenClaw is a *multi‑channel gateway for a personal AI assistant*. They can (and for many users, do) coexist.
+
+---
+
+## Phase 1 — Grounding the Terminology
+
+### 1.1 "Hermes Agent" is a distinct product, not just the Hermes LLM family
+
+Hermes Agent is an **open-source Python framework** from Nous Research, publicly released on **February 25, 2026**, under the MIT license. It is separate from — though made by the same lab as — the Hermes 3 / Hermes 4 model families and the Nomos/Psyche research lines. Nous explicitly markets it as "the agent that grows with you," built around a closed learning loop ([hermes-agent.nousresearch.com](https://hermes-agent.nousresearch.com/), [GitHub: NousResearch/hermes-agent](https://github.com/nousresearch/hermes-agent)).
+
+The current release is **v0.10.0 (April 16, 2026)**, with the team shipping roughly every two weeks; by mid-April 2026 it had accumulated 95K–104K GitHub stars and 200+ contributors ([Hermes Atlas guide](https://hermesatlas.com/guide/), [Digital Applied](https://www.digitalapplied.com/blog/hermes-agent-v0-10-self-improving-open-source-guide), [dev.to review](https://dev.to/jangwook_kim_e31e7291ad98/hermes-agent-review-self-improving-open-source-ai-agent-3kk3)). It is **model-agnostic** — it works with Nous Portal, OpenRouter (200+ models), NVIDIA NIM, OpenAI, Anthropic, Ollama, or any OpenAI-compatible endpoint, with no lock-in to Nous's own Hermes LLMs ([Hermes Agent docs — AI Providers](https://hermes-agent.nousresearch.com/docs/integrations/providers)).
+
+Written in Python 3.11+ with `uv` for dependency management, it is tightly integrated with Nous Research's **Atropos RL framework**, meaning every execution trajectory can optionally be exported to train future tool-calling models ([dev.to / wonderlab breakdown](https://dev.to/wonderlab/one-open-source-project-a-day-no40-hermes-agent-nous-researchs-self-improving-ai-agent-4ale)).
+
+### 1.2 What OpenClaw actually is — and what "pi" refers to
+
+OpenClaw (previously *Clawdbot*, briefly *Moltbot*) is a **TypeScript/Node.js, local-first AI gateway** created by Peter Steinberger (founder of PSPDFKit) starting November 14, 2025. It was renamed to *Moltbot* on January 27, 2026 after an Anthropic trademark complaint, then to *OpenClaw* three days later. On February 15, 2026 Steinberger announced he was joining OpenAI, and OpenClaw transitioned to an independent foundation sponsored by OpenAI ([Wikipedia: OpenClaw](https://en.wikipedia.org/wiki/OpenClaw), [Blink Blog history](https://blink.new/blog/clawdbot-moltbot-openclaw-history-2026), [Cordero Core on Medium](https://medium.com/@cdcore/from-clawdbot-to-openai-what-the-openclaw-story-actually-tells-us-79e3d034f227)). By April 2026 it had surpassed ~300K GitHub stars — reportedly the fastest-growing AI repository in GitHub history ([Pickaxe](https://pickaxe.co/post/hermes-agent-vs-openclaw), [OAX Foundation](https://www.oax.org/2026/03/23/A-Deep-Dive-Into-The-Epic-Rise-of-OpenClaw.html)).
+
+**"Pi" is NOT a protocol interface.** It is **a minimal TypeScript agent SDK** created by **Mario Zechner (of libGDX fame)**, published as the `@mariozechner/pi-*` npm scope. The full name of the monorepo is `badlogic/pi-mono` ([Medium deep-dive](https://shivamagarwal7.medium.com/agentic-ai-pi-anatomy-of-a-minimal-coding-agent-powering-openclaw-5ecd4dd6b440), [Ollama announcement on sci-tech-today](https://www.sci-tech-today.com/news/ollama-pi-coding-agent-launch-openclaw-customization/)). Pi is built around **four core tools only — `read`, `write`, `edit`, `bash`** — and a system prompt under 1000 tokens. It consists of four layered npm packages:
+
+```
+┌─────────────────────────────────────────┐
+│ Your Application                        │
+│ (OpenClaw, a CLI tool, a Slack bot)     │
+├────────────────────┬────────────────────┤
+│ pi-coding-agent    │ pi-tui             │
+│ Sessions, tools,   │ Terminal UI,       │
+│ extensions         │ markdown, editor   │
+├────────────────────┴────────────────────┤
+│ pi-agent-core                           │
+│ Agent loop, tool execution, events      │
+├─────────────────────────────────────────┤
+│ pi-ai                                   │
+│ Streaming, models, multi-provider LLM   │
+└─────────────────────────────────────────┘
+```
+
+OpenClaw does **not** spawn pi as a subprocess — it **embeds** pi's `AgentSession` via `createAgentSession()`, injecting its own tools (messaging, browser, canvas, sessions, cron, gateway, channel-specific actions) on top of pi's base coding tools ([OpenClaw docs — Pi Integration Architecture](https://docs.openclaw.ai/pi), [dabit3 gist on GitHub](https://gist.github.com/dabit3/e97dbfe71298b1df4d36542aceb5f158)). In March 2026, Ollama even shipped `ollama launch pi` to make the bare pi agent usable standalone ([sci-tech-today](https://www.sci-tech-today.com/news/ollama-pi-coding-agent-launch-openclaw-customization/)).
+
+So in one line: **OpenClaw = pi's embedded `AgentSession` + a multi-channel gateway + a skill/plugin system + a Control UI.**
+
+### 1.3 Clarifying the "auto-learning" claim for Hermes
+
+The "auto-learning" Hermes is famous for is **NOT live model weight updates** on your machine. It is a **closed learning loop** made up of three distinct persistence mechanisms working in concert:
+
+| What people call "learning" | What it actually is |
+|---|---|
+| Skill creation | The agent writes a new Markdown `SKILL.md` file to `~/.hermes/skills/` after any task that trips specific triggers (≥5 tool calls, self-correction after an error, user correction, non-obvious successful path) ([36kr](https://eu.36kr.com/en/p/3764418640003840), [Lushbinary skill guide](https://lushbinary.com/blog/hermes-agent-custom-skills-development-guide/)) |
+| Skill self-improvement | When the agent loads a skill and finds an edge case, it edits the same `SKILL.md` file on disk ([dev.to review](https://dev.to/jangwook_kim_e31e7291ad98/hermes-agent-review-self-improving-open-source-ai-agent-3kk3)) |
+| User modeling | Optional **Honcho** integration (a separate Nous-affiliated service) that keeps a **dialectic model** of who you are across sessions using a 12-identity-layer representation ([Honcho integration docs](https://docs.honcho.dev/v3/guides/integrations/hermes), [Hermes Agent Memory docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/honcho)) |
+| Cross-session recall | Every conversation is written to `~/.hermes/state.db` (SQLite + **FTS5** full-text search) and retrieved on demand with an LLM-summarization pass before injection ([vectorize.io memory analysis](https://vectorize.io/articles/hermes-agent-memory-explained)) |
+
+Separately, Hermes can **export trajectories to Atropos for real RL fine-tuning of future Hermes LLMs** — but that is training *new models* at Nous Research, not updating the weights on your laptop ([dev.to / wonderlab](https://dev.to/wonderlab/one-open-source-project-a-day-no40-hermes-agent-nous-researchs-self-improving-ai-agent-4ale)).
+
+> **Verdict.** "Auto-learning" is genuinely novel compared with OpenClaw's static skill catalog — but it is **skill synthesis + persistent memory + dialectic user modeling**, not on-device weight updates. Anyone selling it as "the model itself gets smarter on your Mac" is overselling.
+
+---
+
+## Phase 2 — Core Functionality
+
+### 2.1 Hermes Agent — what makes it "agentic"
+
+At runtime, Hermes is a Python process that wraps a standard **OpenAI-compatible chat-completions loop** with:
+
+- **40+ built-in tools** (read/write/edit files, shell, web search, browser, vision, TTS, image gen, memory, session_search, honcho tools, delegate_task, execute_code, cron, …) ([OpenRouter listing](https://openrouter.ai/apps/hermes-agent), [Hermes Features docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/overview))
+- **118 pre-built skills** shipped in v0.10 across MLOps, research, devops, writing, system administration — plus auto-generated skills from your own usage ([Digital Applied v0.10 writeup](https://www.digitalapplied.com/blog/hermes-agent-v0-10-self-improving-open-source-guide))
+- **Four-layer memory architecture** ([mranand Substack](https://mranand.substack.com/p/inside-hermes-agent-how-a-self-improving), [Hermes Memory docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory)):
+  1. **Prompt memory** — `MEMORY.md` + `USER.md` (agent-curated, snapshot at session start, editable as plain text)
+  2. **Episodic archive** — SQLite + FTS5 with LLM summarization
+  3. **Procedural skills** — auto-generated Markdown skills under `~/.hermes/skills/`
+  4. **User modeling** — optional Honcho dialectic layer
+- **Six terminal backends**: local, Docker (hardened read-only root + dropped capabilities), SSH, Daytona, Singularity, Modal (serverless, hibernates when idle) ([Hermes GitHub README](https://github.com/nousresearch/hermes-agent))
+- **Subagent delegation** — `delegate_task` spawns isolated children with their own context/tools/terminal (default 3 parallel, configurable); subagents can be routed to cheaper models via a `delegation:` config block ([Hermes Delegation docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/delegation))
+- **Programmatic tool calling** — `execute_code` lets the agent write a Python script that calls Hermes tools via RPC, collapsing multi-step pipelines into a single LLM turn
+- **Natural-language cron** — "every Monday 8am…" becomes a scheduled job with delivery to any connected channel
+- **MCP client AND server** — it consumes any MCP server (GitHub, filesystem, custom APIs) and can itself expose its messaging stack as an MCP server so Claude Code, Cursor, or Codex can send messages through it ([Hermes MCP docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp))
+- **Closed learning loop**:
+
+```
+ ┌────────────────────────────────────────────────┐
+ │  1. Task arrives (CLI / Telegram / Slack / …)  │
+ │                     │                          │
+ │                     ▼                          │
+ │  2. Agent loop — tool calls, LLM reasoning     │
+ │                     │                          │
+ │                     ▼                          │
+ │  3. Did this task cross a trigger?             │
+ │      (≥5 tool calls, self-correction, user     │
+ │      correction, novel useful path)            │
+ │                     │                          │
+ │           ┌─────────┴─────────┐                │
+ │           ▼ no                ▼ yes            │
+ │       End turn        4a. Write SKILL.md       │
+ │                       4b. Update MEMORY.md     │
+ │                       4c. Update Honcho model  │
+ │                       4d. Index session FTS5   │
+ │                             │                  │
+ │                             ▼                  │
+ │   5. Next matching task ─► load the new skill  │
+ │      instead of reasoning from scratch         │
+ └────────────────────────────────────────────────┘
+```
+
+The architecture is deliberately designed so the compounding learning happens **outside the context window** (on disk, indexed, retrieved on demand), which is why the team says "the agent gets smarter without growing your token bill" ([mranand Substack](https://mranand.substack.com/p/inside-hermes-agent-how-a-self-improving)).
+
+### 2.2 OpenClaw — gateway-first architecture
+
+OpenClaw is structured around a **single long-running daemon** (Node.js 22+, bound by default to `127.0.0.1:18789`) that owns every channel integration, every skill, every session. Clients (CLI, WebChat UI, mobile nodes, macOS menubar app) connect over WebSocket ([Valletta Software guide](https://vallettasoftware.com/blog/post/openclaw-2026-guide), [Nebius security breakdown](https://nebius.com/blog/posts/openclaw-security)):
+
+```
+          ┌───────────────── OpenClaw Gateway (daemon, :18789) ─────────────────┐
+          │                                                                    │
+ Channels │  WhatsApp  Telegram  Slack  Discord  LINE  iMessage  WeChat  QQ …  │
+ in  ──►  │            │                                                       │
+          │            ▼                                                       │
+          │  ┌──────────────────┐    ┌──────────────┐   ┌─────────────────┐    │
+          │  │ Session Router   │───►│ Agent runner │──►│ pi AgentSession │    │
+          │  └──────────────────┘    └──────────────┘   │ (embedded SDK)  │    │
+          │            │                                │                 │    │
+          │            ▼                                └─────────────────┘    │
+          │  ┌──────────────────┐    ┌─────────────────────────┐               │
+          │  │ Skills registry  │    │ Tools: exec, browser,   │               │
+          │  │ (bundled +       │    │ canvas, cron, message,  │               │
+          │  │  ClawHub + local)│    │ sessions, nodes, …      │               │
+          │  └──────────────────┘    └─────────────────────────┘               │
+          │            │                                                       │
+          │            ▼                                                       │
+          │  LLM provider (Anthropic / OpenAI / Gemini / Ollama / …)           │
+          └────────────────────────────────────────────────────────────────────┘
+                        │
+                        ▼
+   Filesystem: ~/.openclaw/  (openclaw.json, workspace/, skills/, sessions, MEMORY.md …)
+```
+
+Key pieces:
+
+- **Gateway modes** — `local` (loopback only, recommended), `remote` (requires auth token), with support for SSH-tunneling and Tailscale identity headers ([OpenClaw Gateway Commands](https://www.meta-intelligence.tech/en/insight-openclaw-gateway-commands)).
+- **pi embedded**: OpenClaw pins `@mariozechner/pi-*` at version 0.68.1 (as of the docs snapshot) and overrides pi's `bash` with `exec`/`process`, customizes `read`/`edit`/`write` for sandboxing, and injects the channel-specific action tools ([OpenClaw Pi docs](https://docs.openclaw.ai/pi)).
+- **Skills = Markdown files** following the **agentskills.io** standard (same `SKILL.md` spec used by Claude Code, Codex, Cursor, VS Code, and Hermes). Skill "install" is literally dropping a folder under `~/.openclaw/skills/` or running `openclaw skills install <slug>` from ClawHub ([DigitalOcean intro](https://www.digitalocean.com/resources/articles/what-are-openclaw-skills), [Travis Media guide](https://travis.media/blog/openclaw-skills-guide/), [OpenClaw Skills docs](https://docs.openclaw.ai/tools/skills)).
+- **Skill precedence**: workspace skills > managed (`~/.openclaw/skills/`) > bundled (ship with OpenClaw). Snapshotted per session — you restart the gateway to pick up new skills ([Travis Media](https://travis.media/blog/openclaw-skills-guide/)).
+- **Tools vs Skills is a critical distinction** — Skills are *instruction manuals* (no new capability on their own); Tools (`exec`, `browser`, `message`, `cron`, …) are the actual capability switches, gated by `tools.allow` ([WenHao Yu config guide](https://yu-wenhao.com/en/blog/openclaw-tools-skills-tutorial/)).
+- **Channels**: 25+ including WhatsApp, Telegram, **LINE**, Slack, Discord, Signal, iMessage/BlueBubbles, WeChat, QQ, Zalo, Matrix, Microsoft Teams, Google Chat, Feishu, IRC, Nostr, Twitch, plus macOS menubar and iOS/Android companion nodes ([OpenClaw README](https://github.com/openclaw/openclaw)).
+- **Companion surfaces**: Live Canvas (A2UI visual workspace), Voice Wake + Talk Mode (ElevenLabs + system TTS), cron jobs, first-class Tailscale and SSH-tunnel support.
+
+OpenClaw is intentionally **single-user by design**. Credentials (API keys, OAuth tokens, bot tokens) are stored under `~/.openclaw/` in plaintext JSON/Markdown — a design choice security researchers have repeatedly flagged ([Valletta Software](https://vallettasoftware.com/blog/post/openclaw-2026-guide), [AtomicMail security writeup](https://atomicmail.io/blog/using-openclaw-ai-safely-full-privacy-security-guide)).
+
+---
+
+## Phase 3 — Multi-Angle Comparison
+
+### 3.1 Architecture — local gateway vs cloud vs hybrid
+
+Both are **local-first** and both use a daemon model, but the architectural center of gravity is different.
+
+- **OpenClaw**: the Gateway **is** the product. Sessions, routing, channels, tools, and the pi agent session all live inside one Node.js process at `:18789`. Mobile/desktop nodes attach as peers over WebSocket; channels push messages inbound; the agent talks out the same gateway ([Valletta Software](https://vallettasoftware.com/blog/post/openclaw-2026-guide)). Screenshotone accurately summarizes: *"OpenClaw packages an agent around a messaging gateway"* ([ScreenshotOne comparison](https://screenshotone.com/blog/hermes-agent-versus-openclaw/)).
+
+- **Hermes Agent**: the Agent runtime is the product; the messaging gateway is one delivery channel. The same binary gives you (a) an interactive TUI (`hermes`), (b) a gateway process (`hermes gateway`), (c) a programmatic Python API (`AIAgent` class), and (d) an ACP integration for VS Code/Zed/JetBrains ([Hermes FAQ](https://hermes-agent.nousresearch.com/docs/reference/faq/)). Hermes can even run **fully serverless on Modal**, hibernating when idle — not a pattern OpenClaw targets ([Hermes GitHub README](https://github.com/nousresearch/hermes-agent)).
+
+Both can be air-gapped with Ollama/llama.cpp/MLX as the model backend.
+
+### 3.2 Skills / extensions ecosystem
+
+| | OpenClaw | Hermes Agent |
+|---|---|---|
+| **Skill format** | `SKILL.md` per agentskills.io spec (frontmatter + Markdown), plus a richer metadata block for requirements (`bins`, `env`, `config`, `os`, installer specs) | Same `SKILL.md` format per agentskills.io, **portable in both directions** |
+| **Authoring** | Hand-written or generated via Claude/GPT | Same — **plus auto-generated by the agent itself** from completed tasks |
+| **Registry** | ClawHub (~13,000–13,700 skills as of Feb–Mar 2026) ([WenHao Yu](https://yu-wenhao.com/en/blog/openclaw-tools-skills-tutorial/), [AI Makers](https://www.aimakers.co/blog/openclaw-skills-guide/)) | Skills Hub / `hermes skills search`, compatible with ClawHub catalogs and agentskills.io ecosystem |
+| **Versioning** | YAML frontmatter + skill folder; hot-reload with watcher on next turn | YAML frontmatter; loaded on session start |
+| **Distribution** | `openclaw skills install <slug>` (ClawHub); manual folder drop | `hermes skills install openai/skills/<name>`; manual drop into `~/.hermes/skills/` |
+| **Curation/security** | Serious problems — a Koi Security audit of 2,857 ClawHub skills found 341 malicious entries (~12%); later figures cited 824+ malicious skills in a 10,700-skill catalog ([The New Stack](https://thenewstack.io/persistent-ai-agents-compared/), [NxCode comparison](https://www.nxcode.io/resources/news/hermes-agent-vs-openclaw-2026-which-ai-agent-to-choose)) | Smaller catalog, no agent-specific CVEs reported publicly as of April 2026; shipping-set hardening release in v0.5 (200+ PRs) ([bitcoin.com](https://news.bitcoin.com/what-is-hermes-agent-nous-researchs-self-improving-ai-explained/)) |
+
+Because both speak the same `SKILL.md` standard, **most OpenClaw skills you author will run under Hermes essentially unchanged** — and Hermes ships an explicit `hermes claw migrate` command that imports `~/.openclaw` settings, memories, skills, and API keys ([Hermes README](https://github.com/nousresearch/hermes-agent)).
+
+### 3.3 Channel / integration coverage
+
+This is where OpenClaw has a clear lead today, and it matters for a user relying on **LINE** (dominant in Thailand).
+
+**OpenClaw channels** (25+): WhatsApp, Telegram, Slack, Discord, Google Chat, Signal, iMessage/BlueBubbles, IRC, Microsoft Teams, Matrix, Feishu, **LINE**, Mattermost, Nextcloud Talk, Nostr, Synology Chat, Tlon, Twitch, Zalo, Zalo Personal, WeChat, QQ, WebChat, macOS menubar, iOS/Android companion nodes ([OpenClaw README](https://github.com/openclaw/openclaw)). A documented official guide exists specifically for **OpenClaw × LINE Official Account** integration ([Meta Intelligence index](https://www.meta-intelligence.tech/en/insight-openclaw-telegram)).
+
+**Hermes Agent channels** (as of v0.10, ~15+): CLI, Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Mattermost, Email (IMAP/SMTP), SMS (Twilio), DingTalk, Feishu, WeCom, WeChat (via HermesClaw community bridge), BlueBubbles, Home Assistant ([hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)). **LINE is not currently in the first-party list**, and Apple Calendar is not a first-party integration on either side (both rely on a skill such as OpenClaw's `calctl` / `gog` or equivalents) ([awesome-openclaw-skills/README](https://github.com/VoltAgent/awesome-openclaw-skills)).
+
+**Google Workspace & Apple Calendar.** Both stacks rely on community skills (CLIs) rather than native integrations:
+- `gog` — Google Workspace CLI (Gmail, Calendar, Drive, Contacts, Sheets, Docs). Published as an OpenClaw skill, usable by Hermes after minor tweak ([VoltAgent skills list](https://github.com/VoltAgent/awesome-openclaw-skills/blob/main/categories/calendar-and-scheduling.md)).
+- `calctl` — Apple Calendar via `icalBuddy` + AppleScript (macOS-only).
+- `gcal-pro`, `google-calendar`, `fastmail`, `feishu-calendar`, `temporal-cortex` — alternative approaches.
+
+### 3.4 Pricing, licensing, self-hostability
+
+| | OpenClaw | Hermes Agent |
+|---|---|---|
+| **License** | MIT (Copyright Peter Steinberger) ([openclaw/LICENSE](https://github.com/openclaw/openclaw/blob/main/LICENSE)) | MIT ([NousResearch/hermes-agent](https://github.com/nousresearch/hermes-agent)) |
+| **Software cost** | $0 — no license fees, no per-seat pricing ([openclaw-ai.com/pricing](https://openclaw-ai.com/en/pricing/), [C# Corner review](https://www.c-sharpcorner.com/article/is-openclaw-really-free-to-use-and-how-can-you-confirm-costs-and-license-terms/)) | $0 |
+| **Model cost** | Pay-per-token to whichever provider you configure. Typical personal setups $6–$50/month; heavy automation can hit $150+ ([Hostinger breakdown](https://www.hostinger.com/tutorials/openclaw-costs), [SentiSight analysis](https://www.sentisight.ai/how-much-openclaw-cost-per-month/)) | Same pattern. Nous Portal has a free tier; paid tiers bundle credits + access to 300+ models + the v0.10 "Tool Gateway" which includes managed Firecrawl, FAL/FLUX, OpenAI TTS, Browser Use ([Nous Portal subscription page](https://portal.nousresearch.com/manage-subscription), [Hermes Tool Gateway docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/tool-gateway)) |
+| **Hosting cost** | VPS-optional; runs fine on your MacBook | Same; also runs on Modal serverless which hibernates when idle |
+| **Governance** | OpenClaw Foundation (independent, OpenAI-sponsored) since Feb 2026 | Nous Research (stewardship) |
+
+### 3.5 Auto-learning vs static skills
+
+This is the clearest architectural divide.
+
+**Hermes's bet**: a running Hermes instance **compounds value** on workflows it repeats. Nous's own benchmarks claim agents with 20+ self-created skills completed research tasks ~40% faster than a fresh install on the same tasks ([dev.to review](https://dev.to/jangwook_kim_e31e7291ad98/hermes-agent-review-self-improving-open-source-ai-agent-3kk3)) — a vendor-reported number worth treating with caution, but directionally consistent with the architecture. The generated skills don't transfer across domains; they compound within one. User feedback on Reddit echoes a real but imperfect improvement: some users report Hermes self-evaluation is *unreliable*, and manual edits to memory files sometimes get overwritten ([kilo.ai Reddit analysis](https://kilo.ai/articles/openclaw-vs-hermes-what-reddit-says)).
+
+**OpenClaw's bet**: **predictable, human-authored skills**. A skill does the same thing on day 1 and day 100. OpenClaw does have *specific* third-party skills (e.g., `context-anchor`, `continuity`, a community `hermes-like` self-learning skill) that bolt persistence on top, but they're not part of the core product thesis ([VoltAgent skills list](https://github.com/VoltAgent/awesome-openclaw-skills/blob/main/README.md)). This makes OpenClaw **more repeatable and auditable**, which is precisely what you want for clinical/medical automation where unpredicted drift is dangerous.
+
+### 3.6 Model flexibility
+
+Both are emphatically **bring-your-own-model**.
+
+- **Hermes** explicitly supports Nous Portal, OpenRouter (200+ models), NVIDIA NIM, Xiaomi MiMo, z.ai/GLM, Kimi/Moonshot, MiniMax, Hugging Face, OpenAI Codex OAuth, Anthropic direct, Google Gemini (OAuth), Qwen OAuth, Ollama, and any OpenAI-compatible custom endpoint. Switch with `hermes model`, no code changes ([Hermes Providers docs](https://hermes-agent.nousresearch.com/docs/integrations/providers)). Requires a model with ≥64K context ([Hermes Quickstart](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart/)). Subagents can be routed to a cheaper model via `delegation:` config.
+- **OpenClaw** supports 25+ providers: Anthropic (direct API key preferred since Claude OAuth terms got unstable), OpenAI (API key or ChatGPT/Codex OAuth), Google, Gemini, Mistral, Ollama, LM Studio, and custom endpoints ([OpenClaw README](https://github.com/openclaw/openclaw)). Notably flexible on mixed routing — e.g., pinning the 30-minute "heartbeat" loop to Haiku 4.5 while reserving Opus for complex tasks can cut costs significantly ([SFAI Labs workload analysis](https://sfailabs.com/guides/openclaw-cost)).
+
+On your 36 GB M3 Pro, a **Qwen3.5-9B Q4 with a quantized KV cache** fits comfortably under 16 GB and has been specifically documented as a good local pairing for Hermes via llama.cpp or MLX ([Hermes Local LLM on Mac guide](https://hermes-agent.nousresearch.com/docs/guides/local-llm-on-mac)). OpenClaw supports the same via Ollama/LM Studio/LocalAI.
+
+### 3.7 Privacy, data handling, where prompts and tool calls live
+
+**Both are local-first and the machine is your data plane** — but the operational realities differ.
+
+- **OpenClaw**: `~/.openclaw/` holds `openclaw.json` (possibly containing API keys and OAuth tokens), per-agent workspaces, session JSON, Markdown memory files. All **plaintext on disk**; no native at-rest encryption, no incognito mode. The Gateway broadcasts presence via mDNS (`_openclaw-gw._tcp`) which can leak `cliPath` / username / hostname unless you flip to minimal mode or set `OPENCLAW_DISABLE_BONJOUR=1` ([OpenClaw Security docs](https://docs.openclaw.ai/gateway/security), [AtomicMail review](https://atomicmail.io/blog/using-openclaw-ai-safely-full-privacy-security-guide)).
+- **OpenClaw's 2026 security track record is unavoidable in a fair comparison**: CVE-2026-25253 (CVSS 8.8) — one-click WebSocket-hijack RCE that could exfiltrate stored API tokens; CVE-2026-25593 — local command injection via `cliPath`; 40,000+ exposed instances reported by SecurityScorecard; 9 CVEs disclosed in 4 days in March 2026 (highest CVSS 9.9) ([NxCode security summary](https://www.nxcode.io/resources/news/hermes-agent-vs-openclaw-2026-which-ai-agent-to-choose), [AtomicMail](https://atomicmail.io/blog/using-openclaw-ai-safely-full-privacy-security-guide), [Pickaxe comparison](https://pickaxe.co/post/hermes-agent-vs-openclaw)). The community response has been patches, ClawHub VirusTotal scanning, and `openclaw doctor` hardening checks, but the attack surface is real.
+- **Hermes** stores everything under `~/.hermes/` — `MEMORY.md`, `USER.md`, `state.db` (SQLite FTS5), skills as Markdown, `.env` for secrets. No telemetry. Conservative-by-default sandboxing: read-only root filesystem, dropped capabilities, namespace isolation, command approval flows, dangerous-pattern blocking, prompt-injection scanning for external content, LiteLLM credential exposure patched in v0.5 hardening release ([Pickaxe](https://pickaxe.co/post/hermes-agent-vs-openclaw), [bitcoin.com](https://news.bitcoin.com/what-is-hermes-agent-nous-researchs-self-improving-ai-explained/)). **No agent-specific public CVEs reported as of April 2026**.
+- **With Honcho enabled**, your user model and dialectic reasoning data leave the machine to Honcho's service (or you self-host Honcho — note it is **AGPL v3.0**, which has source-disclosure obligations if you build commercial products on top of it, though personal use is fine) ([vectorize.io memory analysis](https://vectorize.io/articles/hermes-agent-memory-explained)).
+
+**For a radiology AI unit in Thailand, PDPA/HIPAA-adjacent considerations are real.** Neither tool has first-party support for PHI handling or audit-grade logging; both would require you to put the agent on an isolated workstation, keep models local (Ollama/MLX), disable cloud providers, and carefully vet every skill and tool.
+
+### 3.8 Maturity, community, release cadence
+
+| | OpenClaw | Hermes Agent |
+|---|---|---|
+| **First release** | Nov 14, 2025 (as Clawdbot) | Feb 25, 2026 |
+| **GitHub stars (Apr 2026)** | ~300,000–345,000 ([Pickaxe](https://pickaxe.co/post/hermes-agent-vs-openclaw), [New Stack](https://thenewstack.io/persistent-ai-agents-compared/)) | ~87K–104K ([Hermes Atlas](https://hermesatlas.com/guide/), [Kanaries](https://docs.kanaries.net/articles/hermes-agent-vs-openclaw)) |
+| **Contributors** | 600+ | 200+ |
+| **Skill catalog size** | 10,700–13,700 | ~118 bundled + growing Skills Hub |
+| **Release cadence** | Very high (new versions regularly, sometimes daily in 2026 Q1) | ~every 2 weeks (v0.8 → v0.9 → v0.10 over ~3 weeks in April) ([Hermes Releases](https://github.com/NousResearch/hermes-agent/releases)) |
+| **Stewardship** | Independent foundation (OpenAI sponsor) | Nous Research |
+| **API stability** | High churn in early 2026; users report update friction | Still pre-1.0 ("the API will change, docs are a moving target") ([dev.to review](https://dev.to/jangwook_kim_e31e7291ad98/hermes-agent-review-self-improving-open-source-ai-agent-3kk3)) |
+
+### 3.9 Other interesting differentiators uncovered
+
+- **HermesClaw**: a community bridge that lets you run Hermes Agent AND OpenClaw on the **same WeChat account** — explicit acknowledgment by both projects that many users run them together ([Hermes README](https://github.com/nousresearch/hermes-agent)).
+- **`hermes claw migrate`**: first-class OpenClaw-to-Hermes migration (with `--dry-run`, `--preset user-data`, etc.). The opposite direction is not as polished. Makes "try Hermes without throwing OpenClaw away" low-risk.
+- **Hermes Tool Gateway** (v0.10): paid Nous Portal subscribers get one-key access to Firecrawl (search), FAL/FLUX 2 Pro (images), OpenAI TTS, Browser Use — no separate API keys ([Tool Gateway docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/tool-gateway)).
+- **OpenClaw Live Canvas + A2UI** — agent-driven visual workspace; OpenClaw also has Voice Wake on macOS/iOS and macOS menubar / iOS / Android companion apps that Hermes doesn't match.
+- **Hermes "execute_code" tool** — single-turn programmatic tool calling where the agent writes a Python script that RPCs Hermes's own tools; saves massive context when doing structured ETL-style pipelines.
+- **Reddit/field consensus**: neither tool replaces the other. The most upvoted community recommendation from r/openclaw is "OpenClaw as orchestrator, Hermes as execution specialist" ([kilo.ai](https://kilo.ai/articles/openclaw-vs-hermes-what-reddit-says)).
+- **Reported Hermes-user quibbles**: self-evaluation can be unreliable; manual `MEMORY.md`/`USER.md` edits can be overwritten by the agent's curation; smaller integration ecosystem than OpenClaw ([kilo.ai](https://kilo.ai/articles/openclaw-vs-hermes-what-reddit-says)).
+- **Reported OpenClaw-user quibbles**: frequent update-driven config migrations; ClawHub skill-supply-chain security; gateway exposure footguns.
+
+---
+
+## Phase 4 — Synthesis
+
+### 4.1 Narrative summary
+
+Both tools are open-source, MIT-licensed, BYOM, skill-driven personal agent frameworks that run a daemon on your own hardware, stream messages through multiple chat channels, and store everything on your own disk. Surface feature lists look 70% identical — *they both have memory, cron, skills, subagents, multi-channel messaging, MCP, browser automation*. The truly meaningful differences are three:
+
+1. **Product shape.** OpenClaw is **"gateway-first"**: it treats channels/routing/sessions as the product and embeds pi (Mario Zechner's minimalist agent SDK) as the brain. Hermes is **"runtime-first"**: it treats the agent loop, memory, and learning as the product, and treats messaging as one delivery surface among several ([ScreenshotOne](https://screenshotone.com/blog/hermes-agent-versus-openclaw/)).
+2. **Learning philosophy.** OpenClaw gives you a massive, human-curated, static skill library (with all the supply-chain risk that implies). Hermes gives you a smaller, hardened set **plus a closed loop that generates new skills from your own usage and a 4-layer memory stack (prompt + SQLite/FTS5 episodic + procedural skills + optional Honcho dialectic user model)**. That loop is genuine — but not weight-level learning.
+3. **Security posture.** OpenClaw's meteoric 2026 growth came with a rough patch of CVEs, ClawHub malicious-skill campaigns, and tens of thousands of exposed instances. Hermes was designed by the successor-wave lab (Nous) with conservative defaults — read-only root FS, dropped capabilities, prompt-injection scanning, no public agent CVEs to date. This is probably the single strongest argument for Hermes if you're building anything that touches patient-adjacent data.
+
+And finally: the `hermes claw migrate` command plus the shared **agentskills.io** `SKILL.md` standard means **switching is cheap and running both is legitimate**.
+
+### 4.2 Side-by-side comparison table
+
+| Dimension | OpenClaw | Hermes Agent |
+|---|---|---|
+| **Creator** | Peter Steinberger (ex-PSPDFKit) → OpenClaw Foundation; now at OpenAI | Nous Research |
+| **First release** | Nov 14, 2025 (as Clawdbot) | Feb 25, 2026 |
+| **Latest version** | Continuously released since early 2026 | v0.10.0 (Apr 16, 2026); v0.11 in progress |
+| **Language / runtime** | TypeScript / Node.js 22+ (bun/pnpm/npm) | Python 3.11+ (uv) |
+| **License** | MIT | MIT |
+| **Agent core** | Embeds pi SDK (`@mariozechner/pi-*` v0.68.1) — 4 tools: `read/write/edit/bash`, <1000-token system prompt | Custom Python agent loop with 40+ built-in tools |
+| **Gateway** | Single Node daemon on `127.0.0.1:18789`, WebSocket, loopback-bound by default | Python process; `hermes gateway start/setup/install` |
+| **Architecture shape** | Gateway-first (sessions, routing, channels are the center) | Agent-first (learning loop, memory, skills are the center) |
+| **Messaging channels (first-party)** | 25+ (WhatsApp, Telegram, **LINE**, Slack, Discord, Signal, iMessage, WeChat, QQ, Zalo, Matrix, Teams, Google Chat, Feishu, IRC, Nostr, Twitch, Tlon, …) | ~15+ (CLI, Telegram, Discord, Slack, WhatsApp, Signal, Email, SMS, Matrix, Mattermost, DingTalk, Feishu, WeCom, BlueBubbles, Home Assistant) — **no LINE** yet |
+| **Companion apps** | macOS menubar, iOS/Android nodes, Live Canvas, Voice Wake/Talk | TUI, local web dashboard (v0.9), ACP editor integration (VS Code/Zed/JetBrains) |
+| **Model flexibility** | 25+ providers; Anthropic/OpenAI/Google/Ollama/LM Studio/custom | 20+ providers; Nous Portal, OpenRouter (200+), NVIDIA NIM, Anthropic, OpenAI Codex OAuth, Gemini, Qwen, Kimi, Ollama, custom — ≥64K ctx required |
+| **Skill format** | `SKILL.md` (agentskills.io) + extra OpenClaw metadata | `SKILL.md` (agentskills.io) |
+| **Skill catalog** | ClawHub: 10,700–13,700 skills (community) | ~118 bundled + growing Skills Hub + agentskills.io-compatible |
+| **Auto-learning** | No native loop; optional community skills approximate it | **Yes: closed learning loop** — auto skill synthesis + self-improvement + FTS5 session recall + optional Honcho dialectic user model |
+| **Weight updates on-device** | No | No — "learning" is memory + skills + user model, not live fine-tuning |
+| **Memory architecture** | `MEMORY.md` + workspace JSON/MD files + session history | 4-layer: MEMORY.md/USER.md + SQLite FTS5 + auto skills + optional Honcho; also 7 pluggable external providers (Mem0, Hindsight, RetainDB, Supermemory, …) |
+| **MCP** | MCP client | **MCP client AND server** (Hermes can expose its messaging stack to Claude Code / Cursor / Codex) |
+| **Subagents / delegation** | Yes (task flows, multi-agent routing, sessions_yield, subagents tool) | `delegate_task` — default 3 parallel, max-depth configurable, per-subagent model routing |
+| **Terminal / sandbox backends** | Local + Docker isolation | Local, Docker (hardened), SSH, Daytona, Singularity, **Modal (serverless)** |
+| **Scheduling** | `cron` tool + skill | Native NL cron + `hermes gateway install` (systemd/launchd) |
+| **Privacy / local data** | `~/.openclaw/` plaintext; mDNS broadcast by default (off-able); credentials in `.env` / config | `~/.hermes/` plaintext; no telemetry; prompt-injection scanning; conservative-by-default container policy |
+| **Public CVEs (2026)** | Several — CVE-2026-25253 (CVSS 8.8), CVE-2026-25593, and a 9-CVE burst in March 2026 | None agent-specific reported publicly as of April 2026; v0.5 hardening release addressed a LiteLLM credential exposure and path traversal |
+| **Install on macOS M3 Pro** | `npm install -g openclaw@latest && openclaw onboard --install-daemon` | `curl -fsSL .../install.sh \| bash` — supports Apple Silicon natively |
+| **Pricing** | $0 software; pay per-token to model provider (~$6–$150+/mo typical) | $0 software; pay per-token; Nous Portal has free tier ($0) plus paid tiers with included credits, 300+ models, and Tool Gateway (Firecrawl/FAL/OpenAI TTS/Browser Use) |
+| **Self-hostable** | Fully | Fully |
+| **Best summary** | *"An assistant I can message from anywhere, across 25 channels, with 10K+ community skills and a massive ecosystem."* | *"An agent that gets better at my specific workflows over time, with a disciplined memory/skill architecture and conservative security defaults."* |
+
+### 4.3 Recommendation for your setup
+
+Your actual situation:
+- **Thailand / radiology AI unit** ⇒ LINE is critical; Thai-language user interactions likely; patient-adjacent data risks are real.
+- **MacBook Pro M3 Pro, 36 GB RAM** ⇒ plenty of headroom for a local 9B Q4 model (~5 GB) + KV cache, and for running both daemons concurrently.
+- **Already using OpenClaw daily** with Telegram, LINE, Google Workspace CLIs, Apple Calendar, many skills ⇒ real sunk configuration; LINE alone makes migration non-trivial.
+- **Technically sophisticated (Python/R/C#/.NET/Dart)** ⇒ can handle both Python (Hermes) and TypeScript (OpenClaw/pi) without friction.
+
+My recommendation is **not** to rip and replace, and not to pick just one. It is:
+
+**1) Keep OpenClaw as your channel/orchestration layer for everything LINE-dependent and anything already working.**
+- You don't have a realistic LINE replacement in Hermes yet.
+- Your Apple Calendar (`calctl`) and Google Workspace (`gog`) skills are OpenClaw-authored; they work, you know them.
+- Lock down OpenClaw: bind to loopback (`gateway.bind: loopback`), set `OPENCLAW_DISABLE_BONJOUR=1`, enforce `tools.allow` (especially `exec` with approval), run `openclaw doctor`, minimize `allowBundled` skills to exactly what you use, update on every release, and prefer bundled skills over ClawHub for anything touching PHI-adjacent data ([OpenClaw Security docs](https://docs.openclaw.ai/gateway/security), [MarkTechPost secure setup](https://www.marktechpost.com/2026/04/11/how-to-build-a-secure-local-first-agent-runtime-with-openclaw-gateway-skills-and-controlled-tool-execution/)).
+
+**2) Install Hermes Agent alongside it and point it at the same workflows that you re-run daily.**
+- Use `hermes claw migrate --dry-run` first to preview what it would import, then `hermes claw migrate --preset user-data` to carry over skills/memories without secrets.
+- Give it two weeks of the same repeated tasks (report generation, MDT prep, literature scans, standard radiology-report structuring). That's where its closed learning loop earns its keep — procedural skills compound where you have repetition. This is the "Hermes wins on the specific, OpenClaw wins on the broad" pattern multiple independent reviewers converge on ([MindStudio](https://www.mindstudio.ai/blog/what-is-hermes-agent-openclaw-alternative), [ScreenshotOne](https://screenshotone.com/blog/hermes-agent-versus-openclaw/), [kilo.ai](https://kilo.ai/articles/openclaw-vs-hermes-what-reddit-says)).
+
+**3) For any pipeline that must stay on-device (anonymized radiology text, draft reports, learned templates):** run a local MLX or Ollama model (Qwen3.5-9B or similar, which fits well in 36 GB) and point *both* OpenClaw and Hermes at the same `http://localhost:…` OpenAI-compatible endpoint. You get local inference, zero cloud token cost for the hot path, and you can still fall back to Claude/GPT via OpenRouter for anything non-sensitive.
+
+**4) A minimal sketch of how the two fit together on your Mac:**
+
+```
+                ┌─────────────────────────────────────────────┐
+                │          MacBook Pro M3 Pro / 36 GB         │
+                │                                             │
+  LINE ───────► │  ┌─────────────────┐                        │
+  Telegram ───► │  │ OpenClaw daemon │ ◄── Telegram, LINE,    │
+  Apple Cal ──► │  │  :18789 (lo)    │     gog, calctl,       │
+  Google WS ──► │  └────────┬────────┘     Apple Calendar     │
+                │           │                                 │
+                │           │ (stable, high-traffic, channel- │
+                │           │  heavy work)                    │
+                │           │                                 │
+                │           ▼                                 │
+                │  ┌─────────────────┐                        │
+                │  │  Shared local   │◄── Ollama / MLX        │
+                │  │  LLM endpoint   │    Qwen3.5-9B Q4       │
+                │  └────────┬────────┘                        │
+                │           ▲                                 │
+                │           │                                 │
+                │           │ (repetitive, learning-worthy    │
+                │           │  radiology workflows)           │
+                │           │                                 │
+                │  ┌────────┴────────┐                        │
+                │  │  Hermes Agent   │                        │
+                │  │  TUI / gateway  │◄── CLI, Telegram (2nd  │
+                │  └─────────────────┘    bot), Email, cron   │
+                │                                             │
+                └─────────────────────────────────────────────┘
+```
+
+**Single-tool fallbacks** if you must pick only one:
+
+- *You care most about LINE + channel breadth + existing skill inventory + not rearchitecting* → **OpenClaw** (hardened).
+- *You care most about auto-improving workflows, cleaner security defaults, and a research-lab-grade learning loop* → **Hermes Agent**. Accept the LINE gap, rebuild gateway-heavy pieces.
+
+---
+
+## Information gaps and honest caveats
+
+- **Both tools post-date typical LLM training cutoffs**; everything above is web-sourced from 2026 material. Feature details (channel list, skill counts, version numbers, CVE details) move weekly for both.
+- **"Auto-learning" should not be conflated with on-device fine-tuning.** Nous's Atropos exports trajectories that may shape *future* Hermes model releases at Nous, but your local weights are static.
+- **The claimed "40% faster on research tasks with 20+ skills" is a vendor benchmark** reported by a secondary reviewer, not a peer-reviewed study ([dev.to review](https://dev.to/jangwook_kim_e31e7291ad98/hermes-agent-review-self-improving-open-source-ai-agent-3kk3)).
+- **Honcho's licensing** is AGPL v3.0 — fine for personal/clinical internal use, but relevant if you ever productize a Hermes-based tool ([vectorize.io](https://vectorize.io/articles/hermes-agent-memory-explained)).
+- **CVE counts and skill-catalog malware percentages** are reported by security vendors with a commercial interest in the finding; directionally consistent across multiple sources but treat specific numbers (e.g., "341 of 2,857 skills malicious," "40,214 exposed instances") as point-in-time estimates, not invariants.
+- **Neither tool has formal medical-device or PDPA certification.** Whatever you deploy in a radiology AI unit needs independent review against your local data-protection rules.
+- **Hermes LINE integration** is not in the first-party gateway list as of v0.10; the community may be working on it, but I could not confirm a merged, maintained integration. If that's a hard requirement, OpenClaw stays in your stack.
+
+If you want, a reasonable next step is a one-week side-by-side experiment: run `hermes claw migrate --dry-run` tonight, pick two repetitive daily tasks (e.g., "summarize this week's MDT cases" and "prepare my morning calendar + urgent email digest"), implement each in both tools, and after a week compare: (a) how many *fewer* tokens Hermes uses once its auto-skills kick in, (b) how many channels each actually covered without a workaround, and (c) whether either daemon ever did something you didn't explicitly authorize. That data will beat any comparison table.
