@@ -9,6 +9,10 @@ book:
   site-url: https://agentic-ai-notes-lightbridge.netlify.app
   chapters:
     - index.qmd
+    - part: Core Agent
+      chapters: 
+        - text: Agentic Loop in a Nutshell
+          href: "contents/core/agentic-loop-in-a-nutshell.qmd"
     - part: Harness
       chapters: 
         - text: OpenClaw vs Hermes Agent

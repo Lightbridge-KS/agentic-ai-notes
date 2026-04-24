@@ -1,0 +1,151 @@
+---
+title: "Agentic Loop in a Nutshell"
+---
+
+
+::: {.callout-note appearance="default" collapse="false"}
+**Q:** Considering the agentic loop from this diagram. What are the key abstraction takeaway that you could consolidate. Please explain and draw a simpler diagram. 
+:::
+
+```
+Agent
+ │
+ ┌─────────────────────┼──────────────────────────┐
+ │                     │                          │
+ ▼                     ▼                          ▼
+MutableAgentState   PendingMessageQueue (x2)   Hooks
+ ├ _tools []         steeringQueue             beforeToolCall()
+ ├ _messages []      followUpQueue             afterToolCall()
+ ├ isStreaming                                    transformContext()
+ └ pendingToolCalls                               convertToLlm()
+
+
+Agent Loop (runAgentLoop)
+════════════════════════
+
+do {
+ ┌────────────────────────────────────────────────────┐
+ │ 1. drain steeringQueue → inject into messages      │
+ │ 2. build Context { systemPrompt, messages, tools } │
+ │ 3. transformContext(ctx)                           │
+ │ 4. streamFn(model, ctx)                            │
+ │                                                    │
+ │    ProxyMessageEventStream ◁── intercepts ──┐      │
+ │                                             │      │
+ │    for await (event) emit(AgentEvent)       │      │
+ │    ├── text-delta → accumulate              │      │
+ │    └── done → finalize message              │      │
+ │                                                    │
+ │ 5. tool calls?                                     │
+ │    ┌─────────────────────────────────────┐         │
+ │    │ for each call:                      │         │
+ │    │ beforeToolCall(tool, args)          │         │
+ │    │   null? → skip                      │         │
+ │    │ tool.prepareArguments(args)         │         │
+ │    │ tool.execute(id, params, signal)    │         │
+ │    │ afterToolCall(tool, result)         │         │
+ │    │ push ToolResultMessage              │         │
+ │    └─────────────────────────────────────┘         │
+ │                                                    │
+ │ 6. drain followUpQueue → inject into messages      │
+ └────────────────────────────────────────────────────┘
+} while (followUpQueue.length > 0)
+ │
+ ▼
+resolve idlePromise → waitForIdle() returns
+```
+
+## Answers 
+
+Looking at that diagram, what strikes me is that it decomposes an agent along three orthogonal axes — and once you see those axes, the whole thing collapses into something much simpler.
+
+**1. State / Flow / Extension — three orthogonal concerns**
+
+The Agent isn't one monolithic thing. It's three independent aspects held together:
+
+- *State* (what the agent knows) — messages, tools, streaming flag
+- *Flow* (what's queued to happen) — the two message queues
+- *Extension* (how behavior is customized) — the hooks
+
+Classic separation of concerns applied to agents. You can swap any one without touching the others.
+
+**2. The loop underneath is Perceive → Reason → Act → Observe**
+
+Strip the plumbing and the inner loop is the oldest agent pattern there is:
+
+- Perceive: drain steering queue, build context
+- Reason: stream from LLM
+- Act: execute tool calls
+- Observe: tool results become new messages
+- Repeat while work remains
+
+Every other detail — streaming, hooks, queues — is scaffolding around this core.
+
+**3. Two queues encode two semantically different kinds of injection**
+
+This is the subtlest design choice. Messages can enter the loop in two ways:
+
+- `steeringQueue` — *external* injections (user interrupts, system redirects) → drained at the **top**, BEFORE reasoning
+- `followUpQueue` — *internal* continuations (tool results, agent self-talk) → drained at the **bottom**, AFTER acting, and drives the `while` condition
+
+So: steering = "change my mind before I think," follow-up = "I need another turn to finish." Same data structure, completely different semantics. The loop terminates iff the follow-up queue is empty — an elegant way to say "keep going until you're done."
+
+**4. Hooks are middleware (inversion of control)**
+
+`transformContext`, `beforeToolCall`, `afterToolCall`, `convertToLlm` are all injection points. They're the agent's equivalent of Express middleware or ASP.NET filters — you don't rewrite the core, you hook into it. `beforeToolCall` returning null-to-skip is especially nice: it unifies permission checks, rate limits, and cache hits into one abstraction.
+
+**5. Streaming is a port/adapter detail**
+
+`ProxyMessageEventStream` is a decorator over the raw LLM stream. The agent consumes `AgentEvent`s and doesn't care whether they originate from OpenAI, Anthropic, or a mock. Classic ports-and-adapters — the LLM vendor is a replaceable plug.
+
+---
+
+**Consolidated diagram:**
+
+```
+         ┌───────────────── Agent ─────────────────┐
+         │                                         │
+         │   STATE        FLOW           HOOKS     │
+         │  (memory)    (2 queues)    (middleware) │
+         │     │            │              │       │
+         └─────┼────────────┼──────────────┼───────┘
+               │            │              │
+               ▼            ▼              ▼
+         ┌────────────────────────────────────────┐
+         │                                        │
+         │          PERCEIVE ──→ REASON           │
+         │             ▲            │             │
+         │             │            ▼             │
+         │          OBSERVE ←──── ACT             │
+         │                                        │
+         └─────────────────┬──────────────────────┘
+                           │
+                  follow-ups left?
+                    yes → loop
+                    no  → idle
+```
+
+And the two-queue distinction, which I think is worth its own picture:
+
+```
+   external input                      internal continuation
+  (user, steering)                    (tool results, self-talk)
+         │                                       │
+         ▼                                       ▼
+   ┌──────────┐                           ┌──────────┐
+   │ steering │ ── drained ──→            │ followUp │ ── drained ──→
+   │  queue   │   BEFORE reason           │  queue   │   AFTER act
+   └──────────┘                           └──────────┘
+         │                                       │
+         │            ┌──────────┐               │
+         └───────────→│   LOOP   │ ←─────────────┘
+                      └──────────┘
+                           │
+                           ▼
+                  terminates when
+                  followUp is empty
+```
+
+---
+
+The deepest takeaway for me: **an agent is just a loop with state, pluggable policy, and two kinds of message injection.** Streaming, tool execution, and LLM vendors are all swappable modules hanging off those three anchors. Once you internalize that, every agent framework you read afterward — LangGraph, AutoGen, CrewAI, Pydantic AI — becomes variations on the same skeleton with different opinions about where to put the hooks.
