@@ -1,0 +1,4 @@
+- source: project
+  netlify:
+    - id: 382cead9-55ad-4111-a063-184b9a56e90a
+      url: https://agentic-ai-notes-lightbridge.netlify.app
