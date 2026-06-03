@@ -19,6 +19,10 @@ book:
           href: "contents/harness/HermesAgent-vs-OpenClaw.qmd"
         - text: Hermes Agent Python Core
           href: "contents/harness/hermes-agent-python-core.qmd"
+    - part: Persona
+      chapters: 
+        - text: Toro
+          href: "contents/persona/toro.qmd"
 
 format:
   html:
