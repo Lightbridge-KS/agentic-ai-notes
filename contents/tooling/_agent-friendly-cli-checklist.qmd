@@ -1,0 +1,62 @@
+<!--
+Reusable "Agent-Friendly CLI" specification.
+Drop this whole block into any repo's AGENTS.md / CLAUDE.md / docs to define
+the contract a CLI must satisfy to be reliably driven by an agent.
+Included in the book via `{{< include _agent-friendly-cli-checklist.qmd >}}`.
+-->
+
+> **Agent-Friendly CLI — design contract.** Treat an autonomous agent as a
+> first-class consumer of this CLI, alongside the human operator. Every command
+> must satisfy the following. Use this as a definition-of-done you can self-audit
+> against.
+
+**1. Stable machine output.**
+
+- `--json` emits a single JSON object for finite commands and **newline-delimited
+  JSON (NDJSON)** for streaming commands — one event per line, flushed immediately.
+- `--plain` emits stable, line-oriented, column-stable text (no tables, no ANSI).
+- Human-readable output is the default; machine output is never the default but is
+  always *available* without parsing prose.
+
+**2. stdout is data; stderr is everything else.**
+
+- Only the requested result goes to stdout.
+- Diagnostics, progress, warnings, reconnection notices, and `--verbose` output go
+  to stderr. A consumer piping stdout must never have to filter noise out of it.
+
+**3. Exit codes are the control-flow contract.**
+
+- Distinct, documented exit codes for distinct failure classes (e.g. usage error,
+  auth required, not found, unauthorized, network down, bad server response).
+- Scripts and agents **branch on exit codes, never on error message text.**
+
+**4. Never block waiting for a human.**
+
+- `--no-input` (or an equivalent) disables every interactive prompt; the command
+  either proceeds with what it has or fails with a clear exit code.
+- Input precedence is explicit and documented, e.g. positional arg → `--body` →
+  `--file <path>` → stdin. Reading from stdin is always supported for composability.
+
+**5. Configuration resolves in a documented order.**
+
+- Precedence, highest to lowest: **CLI flags → environment variables → user config
+  file → built-in defaults.** No hidden surprises.
+- Credentials are scoped to the endpoint they belong to, so a token for one server
+  is never sent to another.
+
+**6. Long-running / streaming commands are durably recoverable.**
+
+- Persist a cursor (or equivalent resume token) to a known state path after each
+  event.
+- On restart: load the cursor, fetch what was missed, then resume the live stream.
+- Handle a "resync required" signal by refetching state rather than dying.
+
+**7. Discoverability.**
+
+- `--help` on every command and subcommand; `--version`; shell completions.
+- Errors name the flag/argument at fault and, where possible, the fix.
+
+**Self-audit prompt (for an agent):** *"Can I run every command this tool exposes
+non-interactively, capture machine-readable output from stdout alone, decide
+success or failure from the exit code without reading any message, and resume any
+stream after a crash? If not, which command breaks the contract?"*

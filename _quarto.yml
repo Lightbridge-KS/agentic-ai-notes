@@ -19,8 +19,12 @@ book:
           href: "contents/harness/HermesAgent-vs-OpenClaw.qmd"
         - text: Hermes Agent Python Core
           href: "contents/harness/hermes-agent-python-core.qmd"
+    - part: Tooling & Interfaces
+      chapters:
+        - text: Agent-Friendly CLI Design
+          href: "contents/tooling/agent-friendly-cli.qmd"
     - part: Persona
-      chapters: 
+      chapters:
         - text: Toro
           href: "contents/persona/toro.qmd"
 

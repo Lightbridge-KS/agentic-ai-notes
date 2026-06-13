@@ -1,0 +1,223 @@
+---
+title: "Agent-Friendly CLI Design"
+subtitle: "Designing a command-line tool that an autonomous agent can drive as reliably as a human can"
+---
+
+**Framing.** A command-line tool used to have exactly one operator: a person at a
+terminal, reading prose output and deciding what to type next. Agentic systems add
+a second operator with very different needs — an LLM that *spawns* the process,
+*parses* its output, and *branches* on the result without a human in the loop. A
+CLI that was only ever designed for the first operator tends to fail the second in
+quiet, maddening ways: it prints a pretty table the agent can't parse, it blocks on
+an interactive prompt nobody answers, or it returns exit code `0` while printing
+`error:` to stdout.
+
+The **agent-friendly CLI** is the discipline of treating that second operator as a
+first-class consumer. The clearest worked example I've found is the design doc for
+**clickclack**, the CLI/server from the OpenClaw ecosystem
+([`docs/agent-friendly-cli.md`](https://github.com/openclaw/clickclack/blob/main/docs/agent-friendly-cli.md)).
+This chapter pulls the durable principles out of that doc, connects them to the
+pre-agentic CLI-design canon, and ends with a reusable contract you can drop into
+any repo.
+
+---
+
+## 1. What changes when the operator is an LLM
+
+Most of what makes a CLI pleasant for a human also makes it usable for an agent —
+the agent-era guidelines are largely the [clig.dev Command Line Interface
+Guidelines](https://clig.dev) and the "12-Factor CLI" ideas **re-derived under one
+extra constraint: the operator cannot improvise.** A human reading `error: channel
+"ops" not found, did you mean "op"?` self-corrects instantly. An agent reading the
+same string has to be *prompted* to parse it, might hallucinate a fix, and has no
+stable signal to branch on.
+
+So the shift is less "invent new rules" and more "stop relying on human
+adaptability." Concretely:
+
+| Human operator tolerates | Agent operator needs instead |
+|---|---|
+| Prose output, pretty tables, colour | A declared machine format (`--json`, `--plain`) |
+| Reading the error message to decide | A **stable exit code** to branch on |
+| Answering an interactive prompt | `--no-input` and stdin-driven input |
+| "It usually reconnects if I re-run it" | Durable cursor recovery, no lost events |
+| Mixed stdout/stderr they can eyeball | stdout = data only; stderr = everything else |
+
+The rest of the chapter is those five rows, made concrete.
+
+---
+
+## 2. The six pillars
+
+### 2.1 A stable machine-output contract
+
+The default output stays human-friendly (`sent msg_01kr… to #ops`). The contract
+is that a machine format is always *one flag away* and never requires parsing prose:
+
+- `--json` → a **single JSON object** for finite commands.
+- `--json` on a **stream** → **newline-delimited JSON (NDJSON)**, one event per
+  line, flushed as it happens.
+- `--plain` → stable, column-stable, ANSI-free lines for `awk`/`cut`-style consumers.
+
+```json
+// finite command, --json
+{"message":{"id":"msg_01kr...","channel_id":"chn_...","body":"hello"}}
+
+// streaming command, --json  (one self-describing object per line)
+{"type":"message.created","cursor":"evt_...","message":{"id":"msg_..."}}
+```
+
+The detail that earns its keep: each streamed object **carries its own
+`cursor`/`type`** — the stream is self-describing, so a consumer that reconnects
+knows exactly where it is. (More on that in §2.6.)
+
+### 2.2 stdout is data; stderr is everything else
+
+This is the single most violated rule and the one agents punish hardest. The
+clickclack rule is absolute: **only the requested result goes to stdout**;
+diagnostics, warnings, reconnection notices, and `--verbose` all go to **stderr**.
+
+```
+agent-summarize incident.log | clickclack threads reply msg_01kr... --stdin
+                                         │
+                  stdout ───────────────►│  clean JSON/text the agent parses
+                  stderr ─ ─ ─ ─ ─ ─ ─ ─ ┘  "reconnecting…", warnings, debug
+```
+
+If a "reconnecting…" notice lands in stdout, every downstream `jq` breaks. Keeping
+the channels disjoint is what makes the tool safe to pipe.
+
+### 2.3 Exit codes are the control-flow contract
+
+> *Scripts should branch on codes, not error messages.*
+
+clickclack assigns distinct codes to distinct failure classes:
+
+| Code | Meaning | Code | Meaning |
+|---|---|---|---|
+| 0 | Success | 5 | Authenticated but unauthorized |
+| 1 | Generic failure | 10 | Network unavailable |
+| 2 | Invalid usage / validation | 11 | Server returned unexpected response |
+| 3 | Auth required / invalid | | |
+| 4 | Resource not found | | |
+
+The payoff is that an agent can write *real* control flow — "retry on 10, re-auth on
+3, give up on 2" — without ever reading a sentence. Error **messages** are for the
+human; exit **codes** are the machine API. Both must exist; neither substitutes for
+the other.
+
+### 2.4 Never block waiting for a human
+
+An agent that hits an interactive prompt hangs forever. Two mechanisms prevent it:
+
+- `--no-input` disables every prompt; the command proceeds or fails with a code.
+- A documented **input precedence** so the body can come from wherever the caller
+  has it: positional arg → `--body <text>` → `--file <path>` → `--stdin`.
+
+```sh
+clickclack send "hello from a script"                       # positional
+clickclack messages send --channel ops --file incident.md   # from a file
+printf 'build passed\n' | clickclack send --stdin            # from a pipe
+```
+
+stdin support is what makes the tool a good Unix citizen — it composes with
+whatever produced the text upstream (a log, another agent, a heredoc).
+
+### 2.5 Configuration resolves in a documented order
+
+Predictability beats cleverness. clickclack resolves config highest-to-lowest:
+
+```
+1. CLI flags             --server / --token / --channel ...   (most explicit)
+2. Environment variables CLICKCLACK_SERVER, CLICKCLACK_TOKEN
+3. User config file      ~/.config/clickclack/config.json
+4. Built-in defaults     localhost:8080                       (least explicit)
+```
+
+An agent can set everything via env vars for one invocation and override a single
+value with a flag, with zero ambiguity about which wins. Note also that credentials
+are **scoped to the server** they belong to — a token for one endpoint is never
+leaked to another, which matters the moment an agent talks to both localhost and a
+hosted server in the same session.
+
+### 2.6 Long-running streams must be durably recoverable
+
+This is the pillar most CLIs skip, and the one that separates "demo" from
+"production agent infrastructure." Streaming commands (`messages tail`, `watch`,
+`events tail`) survive restarts:
+
+```
+            ┌──────────────────────────────────────────────┐
+ restart ──►│ 1. load saved cursor                          │
+            │      ~/.local/state/clickclack/cursors/       │
+            │ 2. GET /api/realtime/events?after_cursor=...   │  ← replay the gap
+            │ 3. open WebSocket /api/realtime/ws             │  ← go live
+            │ 4. persist cursor after EACH event            │  ← never lose place
+            │ 5. on `resync_required` → refetch state        │  ← self-heal
+            └──────────────────────────────────────────────┘
+```
+
+Because every event carries its cursor (§2.1) and the cursor is persisted after each
+one, an agent watcher that crashes and respawns loses **no** events and produces **no**
+duplicates-by-default. That is the property that lets you trust an agent to babysit a
+channel for days.
+
+---
+
+## 3. The clickclack command surface, briefly
+
+The doc also models a clean command taxonomy worth imitating — verbs grouped by
+domain rather than a flat soup:
+
+```
+server      serve · migrate · backup · export
+auth        login · logout · whoami · status
+workspace   workspaces list/use · channels list/use/create
+messaging   send · messages send/list/tail/watch · threads open/reply
+            reactions add/remove · events tail
+```
+
+with global flags (`--server`, `--workspace`, `--channel`, `--token`, `--json`,
+`--plain`, `--no-input`, `--verbose`, `--no-color`) that apply uniformly. Uniformity
+is itself an agent-friendliness property: an agent that learns the flag convention
+once can apply it to every subcommand.
+
+A representative end-to-end agent usage:
+
+```sh
+# stream a channel as JSON, non-interactively, against a hosted server
+CLICKCLACK_SERVER=https://clickclack.chat \
+CLICKCLACK_TOKEN=ses_... \
+clickclack messages tail --channel ops --json --no-input
+
+# CI branching purely on success/failure
+if pnpm test; then
+  clickclack send --channel builds "tests passed"
+else
+  clickclack send --channel builds "tests failed"
+fi
+```
+
+---
+
+## 4. A reusable contract for your own repos
+
+The principles above are not specific to a chat CLI — they apply to any tool an
+agent will drive. The block below is written to be **dropped verbatim into another
+repo's `AGENTS.md` / `CLAUDE.md` / design doc** as a definition-of-done. In this
+book it is a single included source file, so it stays in sync everywhere it appears.
+
+{{< include _agent-friendly-cli-checklist.qmd >}}
+
+---
+
+## 5. Takeaways
+
+- An agent is a **second operator** with a stricter contract than a human: it can't
+  improvise around prose, prompts, or ambiguous failures.
+- The contract is mostly the **pre-agentic CLI canon** (clig.dev, 12-factor CLI)
+  enforced rigorously — plus one genuinely new requirement: **durable stream
+  recovery** for long-running watchers.
+- Keep the two interfaces layered, not forked: human-readable by default, machine
+  output one flag away, exit codes as the real API.
+- Reuse the §4 contract as a checklist; an agent can self-audit any CLI against it.
